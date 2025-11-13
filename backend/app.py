@@ -196,7 +196,8 @@ logger.info("Loaded HOMEFINDER page...")
                 )
             except Exception:
                 continue
-
+                
+logger.info("Scraped {len(results)} listings...")
         return results
     finally:
         try:
