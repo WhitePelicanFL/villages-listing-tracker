@@ -124,29 +124,54 @@ def scrape_listings() -> List[Dict]:
     driver = make_driver()
 
     try:
-        logger.info("Loading Homefinder list view…")
-        driver.get("https://www.thevillages.com/homefinder/#/homes?view=list")
+        url = "https://www.thevillages.com/homefinder/#/homes?view=list"
+        logger.info(f"Loading URL: {url}")
+        driver.get(url)
 
-        # Give Angular router time to bootstrap
-        time.sleep(5)
+        # Force AngularJS to initialize (Render headless often stalls without this)
+        driver.execute_script("""
+            window.scrollTo(0, 0);
+            document.body.dispatchEvent(new Event('mousemove'));
+            document.body.dispatchEvent(new Event('keydown'));
+        """)
 
-        # Wait for ANY property cards to appear
+        time.sleep(5)  # Let Angular load scripts + router
+
+        # Try clicking the FILTER button to trigger DOM activity
         try:
-            WebDriverWait(driver, 25).until(
+            filter_btn = WebDriverWait(driver, 8).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, "button.md-button"))
+            )
+            driver.execute_script("arguments[0].click();", filter_btn)
+            logger.info("Clicked a button to wake Angular.")
+            time.sleep(1)
+            driver.back()
+        except:
+            logger.info("Filter button not found — continuing anyway.")
+
+        # NOW wait for listing cards
+        try:
+            WebDriverWait(driver, 20).until(
                 EC.presence_of_element_located(
                     (By.CSS_SELECTOR, "md-card.propertyCard, md-card._md")
                 )
             )
-            logger.info("Listing cards detected.")
-        except:
-            logger.error("ERROR: No listing cards ever appeared.")
+            logger.info("Listing cards appeared.")
+        except Exception:
+            logger.error("ERROR: No listing cards ever appeared (Angular did not render).")
+            # SAVE screenshot to debug
+            try:
+                driver.save_screenshot("/tmp/homefinder_debug.png")
+                logger.error("Screenshot saved to /tmp/homefinder_debug.png")
+            except:
+                pass
             return []
 
         time.sleep(2)
 
-        # Scroll until no new cards appear
+        # Scroll to get all cards
         cards_seen = 0
-        attempts = 0
+        stuck = 0
 
         while True:
             cards = driver.find_elements(
@@ -154,18 +179,19 @@ def scrape_listings() -> List[Dict]:
             )
 
             if len(cards) == cards_seen:
-                attempts += 1
-                if attempts >= 4:
+                stuck += 1
+                if stuck >= 4:
                     break
             else:
-                attempts = 0
+                stuck = 0
                 cards_seen = len(cards)
 
-            driver.execute_script("window.scrollBy(0, 1200);")
-            time.sleep(1.2)
+            driver.execute_script("window.scrollBy(0, 1400);")
+            time.sleep(1.1)
 
-        logger.info(f"Total md-card elements detected: {cards_seen}")
+        logger.info(f"Total cards found: {cards_seen}")
 
+        # Extract data
         results = []
 
         for c in cards:
@@ -173,23 +199,19 @@ def scrape_listings() -> List[Dict]:
                 full_text = c.text
                 lower = full_text.lower()
 
-                # Listing status
                 status = "active"
                 if "pending" in lower or "under contract" in lower:
                     status = "pending"
 
-                # New home vs preowned
                 list_type = "preowned"
                 if "new home" in lower or "model" in lower:
                     list_type = "new"
 
-                # Village extraction
                 village = ""
                 try:
                     village_el = c.find_element(By.CSS_SELECTOR, ".prop_village")
                     village = village_el.text.strip()
                 except:
-                    # Fallback heuristic
                     for line in full_text.splitlines():
                         if "village" in line.lower():
                             village = line.strip()
@@ -204,12 +226,10 @@ def scrape_listings() -> List[Dict]:
                     "village": village,
                     "region": region
                 })
-
-            except Exception as e:
-                logger.error(f"Error parsing card: {e}")
+            except:
                 continue
 
-        logger.info(f"Scraped {len(results)} listings total.")
+        logger.info(f"Scraped {len(results)} listings.")
         return results
 
     finally:
