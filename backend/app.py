@@ -254,10 +254,23 @@ def run_count() -> Dict:
 def status():
     return {"status": "ok"}
 
+#@app.post("/run")
+#def trigger_run(background_tasks: BackgroundTasks):
+#    background_tasks.add_task(run_count)
+#    return JSONResponse({"status": "started"})
 @app.post("/run")
 def trigger_run(background_tasks: BackgroundTasks):
-    background_tasks.add_task(run_count)
+    logger.info("RUN endpoint received request — starting background task.")
+    background_tasks.add_task(debug_run_count)
     return JSONResponse({"status": "started"})
+
+def debug_run_count():
+    logger.info("Background task started.")
+    try:
+        result = run_count()
+        logger.info(f"Background task completed successfully. Result summary: {result.get('total_active')} active, {result.get('total_pending')} pending.")
+    except Exception as e:
+        logger.error(f"Error during run_count(): {str(e)}", exc_info=True)
 
 @app.get("/latest")
 def latest():
