@@ -123,67 +123,75 @@ def make_driver():
 
 
 def scrape_listings() -> List[Dict]:
-    """
-    Scraper tuned for the current TheVillages.com Homefinder Angular layout.
-
-    It looks for md-card.propertyCard elements in the left-hand list and
-    extracts status, village, model, beds/baths/sqft, price, etc.
-    """
     logger.info("Launching Selenium WebDriver...")
     driver = make_driver()
+
     try:
         driver.get(HOMEFINDER_URL)
-        time.sleep(3)
+        time.sleep(4)
         logger.info("Loaded HOMEFINDER page…")
 
-        # Wait until at least one card is present
+        # CLICK THE LIST VIEW BUTTON (necessary in headless browsers)
+        try:
+            logger.info("Trying to click list-view toggle button…")
+            list_button = WebDriverWait(driver, 15).until(
+                EC.element_to_be_clickable(
+                    (By.CSS_SELECTOR, "button[aria-label='Show List'], button.list-toggle")
+                )
+            )
+            list_button.click()
+            logger.info("List view button clicked.")
+            time.sleep(2)
+        except Exception as e:
+            logger.error("List view button NOT found/clickable — continuing anyway.")
+            logger.error(str(e))
+
+        # NOW wait for cards to render
+        logger.info("Waiting for property cards…")
         WebDriverWait(driver, 20).until(
-            EC.presence_of_all_elements_located((By.CSS_SELECTOR, "md-card.propertyCard"))
+            EC.presence_of_all_elements_located(
+                (By.CSS_SELECTOR, "md-card.propertyCard")
+            )
         )
-        time.sleep(1)
 
         cards = driver.find_elements(By.CSS_SELECTOR, "md-card.propertyCard")
-        logger.info(f"Found {len(cards)} listing cards…")
+        logger.info(f"Found {len(cards)} listing cards.")
 
-        listings: List[Dict] = []
+        listings = []
 
         for card in cards:
             html = card.get_attribute("innerHTML")
 
-            # STATUS: Pending if the Angular block is using ListingStatus == 'P'
+            # Status
             status = "Pending" if "ListingStatus == 'P'" in html else "Active"
 
-            # VLS number
+            # VLS #
             try:
                 vls_raw = card.find_element(
                     By.CSS_SELECTOR, ".infoContainer span.ng-binding"
                 ).text
-                # example: "VLS# 247933"
                 vls = vls_raw.replace("VLS#", "").strip()
-            except Exception:
+            except:
                 vls = ""
 
             # Model
             try:
                 model = card.find_element(By.CSS_SELECTOR, "span.prop_model").text.strip()
-            except Exception:
+            except:
                 model = ""
 
-            # Beds / Baths / Sqft
+            # Beds/Baths/Sqft
             beds = baths = sqft = ""
             try:
-                # entire line: "Charlotte 3 bd • 2 ba • 1492sqft"
-                attr_text = card.find_element(
-                    By.CSS_SELECTOR, ".prop-attr"
-                ).text
-                parts = attr_text.split("•")
+                attr = card.find_element(By.CSS_SELECTOR, ".prop-attr").text
+                parts = attr.split("•")
                 if len(parts) >= 1:
                     beds = parts[0].replace("bd", "").strip()
                 if len(parts) >= 2:
                     baths = parts[1].replace("ba", "").strip()
                 if len(parts) >= 3:
                     sqft = parts[2].replace("sqft", "").strip()
-            except Exception:
+            except:
                 pass
 
             # Village
@@ -191,52 +199,51 @@ def scrape_listings() -> List[Dict]:
                 village = card.find_element(
                     By.CSS_SELECTOR, "span.prop_village"
                 ).text.strip()
-            except Exception:
+            except:
                 village = ""
 
-            # Price (Active only; Pending listings often omit this)
+            # Price
             try:
                 price = card.find_element(By.CSS_SELECTOR, "span.price").text.strip()
-            except Exception:
+            except:
                 price = ""
 
-            # Furnished tag
+            # Furnished?
             furnished = "Yes" if "Furnished" in html else "No"
 
-            # Photo URL
+            # Photo
             try:
                 photo = card.find_element(
                     By.CSS_SELECTOR, "img.front-photo"
                 ).get_attribute("src")
-            except Exception:
+            except:
                 photo = ""
 
             region = classify_region(village)
 
-            listings.append(
-                {
-                    "vls": vls,
-                    "status": status,
-                    "model": model,
-                    "beds": beds,
-                    "baths": baths,
-                    "sqft": sqft,
-                    "village": village,
-                    "region": region,
-                    "price": price,
-                    "furnished": furnished,
-                    "photo": photo,
-                }
-            )
+            listings.append({
+                "vls": vls,
+                "status": status,
+                "model": model,
+                "beds": beds,
+                "baths": baths,
+                "sqft": sqft,
+                "village": village,
+                "region": region,
+                "price": price,
+                "furnished": furnished,
+                "photo": photo,
+            })
 
-        logger.info(f"Final count: {len(listings)} listings scraped.")
+        logger.info(f"Scraped {len(listings)} listings.")
         return listings
+
     finally:
         try:
             driver.quit()
-        except Exception:
+        except:
             pass
-
+            
 
 def run_count() -> Dict:
     listings = scrape_listings()
