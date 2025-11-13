@@ -123,6 +123,8 @@ def scrape_listings() -> List[Dict]:
 
     You will likely need to tweak CSS selectors once you inspect the live HTML.
     """
+    
+    logger.info("Launching Selenium WebDriver.")
     driver = make_driver()
     try:
         driver.get(HOMEFINDER_URL)
