@@ -127,11 +127,11 @@ def scrape_listings() -> List[Dict]:
     logger.info("Launching Selenium WebDriver...")
     driver = make_driver()
     try:
-        driver.get(HOMEFINDER_URL)
-    logger.info("Loaded HOMEFINDER page...")
-        
+        driver.get(HOMEFINDER_URL)    
         time.sleep(3)
 
+    logger.info("Loaded HOMEFINDER page...")
+    
         # Try to locate the listing container
         try:
             # adjust selectors as needed based on actual DOM
