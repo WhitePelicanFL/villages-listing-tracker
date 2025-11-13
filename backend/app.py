@@ -109,8 +109,6 @@ def init_db():
 init_db()
 
 # --------- Selenium helpers & scraping ---------
-
-
 def make_driver():
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
@@ -121,129 +119,90 @@ def make_driver():
     driver = webdriver.Chrome(options=chrome_options)
     return driver
 
-
 def scrape_listings() -> List[Dict]:
     logger.info("Launching Selenium WebDriver...")
     driver = make_driver()
 
     try:
-        driver.get(HOMEFINDER_URL)
-        time.sleep(4)
-        logger.info("Loaded HOMEFINDER page…")
+        driver.get(HOMEFINDER_URL + "?view=list")
+        logger.info("Loaded HOMEFINDER page… waiting for listings…")
 
-        # CLICK THE LIST VIEW BUTTON (necessary in headless browsers)
+        # Wait up to 20 seconds for FIRST listing card to appear
         try:
-            logger.info("Trying to click list-view toggle button…")
-            list_button = WebDriverWait(driver, 15).until(
-                EC.element_to_be_clickable(
-                    (By.CSS_SELECTOR, "button[aria-label='Show List'], button.list-toggle")
-                )
+            WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "md-card.propertyCard"))
             )
-            list_button.click()
-            logger.info("List view button clicked.")
-            time.sleep(2)
-        except Exception as e:
-            logger.error("List view button NOT found/clickable — continuing anyway.")
-            logger.error(str(e))
+            logger.info("List view detected — cards are loading.")
+        except Exception:
+            logger.error("ERROR: Listing cards NEVER appeared — returning empty list.")
+            return []
 
-        # NOW wait for cards to render
-        logger.info("Waiting for property cards…")
-        WebDriverWait(driver, 20).until(
-            EC.presence_of_all_elements_located(
-                (By.CSS_SELECTOR, "md-card.propertyCard")
-            )
-        )
+        time.sleep(2)  # give Angular time to render additional cards
 
-        cards = driver.find_elements(By.CSS_SELECTOR, "md-card.propertyCard")
-        logger.info(f"Found {len(cards)} listing cards.")
+        # Scroll to load all results
+        cards_seen = 0
+        scroll_attempts = 0
 
-        listings = []
+        while True:
+            cards = driver.find_elements(By.CSS_SELECTOR, "md-card.propertyCard")
+            if len(cards) == cards_seen:
+                scroll_attempts += 1
+                if scroll_attempts > 3:
+                    break
+            else:
+                scroll_attempts = 0
+                cards_seen = len(cards)
 
-        for card in cards:
-            html = card.get_attribute("innerHTML")
+            driver.execute_script("window.scrollBy(0, 800);")
+            time.sleep(1)
 
-            # Status
-            status = "Pending" if "ListingStatus == 'P'" in html else "Active"
+        logger.info(f"Total cards found: {cards_seen}")
 
-            # VLS #
+        results = []
+        for c in cards:
             try:
-                vls_raw = card.find_element(
-                    By.CSS_SELECTOR, ".infoContainer span.ng-binding"
-                ).text
-                vls = vls_raw.replace("VLS#", "").strip()
-            except:
-                vls = ""
+                full_text = c.text
+                lower = full_text.lower()
 
-            # Model
-            try:
-                model = card.find_element(By.CSS_SELECTOR, "span.prop_model").text.strip()
-            except:
-                model = ""
+                # status
+                status = "active"
+                if "pending" in lower or "under contract" in lower:
+                    status = "pending"
 
-            # Beds/Baths/Sqft
-            beds = baths = sqft = ""
-            try:
-                attr = card.find_element(By.CSS_SELECTOR, ".prop-attr").text
-                parts = attr.split("•")
-                if len(parts) >= 1:
-                    beds = parts[0].replace("bd", "").strip()
-                if len(parts) >= 2:
-                    baths = parts[1].replace("ba", "").strip()
-                if len(parts) >= 3:
-                    sqft = parts[2].replace("sqft", "").strip()
-            except:
-                pass
+                # type
+                list_type = "preowned"
+                if "new home" in lower or "model" in lower:
+                    list_type = "new"
 
-            # Village
-            try:
-                village = card.find_element(
-                    By.CSS_SELECTOR, "span.prop_village"
-                ).text.strip()
-            except:
+                # village parsing
                 village = ""
+                try:
+                    village_el = c.find_element(By.CSS_SELECTOR, ".prop_village, .ng-binding")
+                    village = village_el.text.strip()
+                except:
+                    pass
 
-            # Price
-            try:
-                price = card.find_element(By.CSS_SELECTOR, "span.price").text.strip()
-            except:
-                price = ""
+                region = classify_region(village)
 
-            # Furnished?
-            furnished = "Yes" if "Furnished" in html else "No"
+                results.append({
+                    "title": full_text[:120],
+                    "status": status,
+                    "type": list_type,
+                    "village": village,
+                    "region": region
+                })
 
-            # Photo
-            try:
-                photo = card.find_element(
-                    By.CSS_SELECTOR, "img.front-photo"
-                ).get_attribute("src")
-            except:
-                photo = ""
+            except Exception:
+                continue
 
-            region = classify_region(village)
-
-            listings.append({
-                "vls": vls,
-                "status": status,
-                "model": model,
-                "beds": beds,
-                "baths": baths,
-                "sqft": sqft,
-                "village": village,
-                "region": region,
-                "price": price,
-                "furnished": furnished,
-                "photo": photo,
-            })
-
-        logger.info(f"Scraped {len(listings)} listings.")
-        return listings
+        logger.info(f"Scraped {len(results)} listings.")
+        return results
 
     finally:
         try:
             driver.quit()
         except:
             pass
-            
 
 def run_count() -> Dict:
     listings = scrape_listings()
