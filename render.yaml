@@ -9,12 +9,12 @@ services:
   - type: web
     name: villages-tracker-web
     env: static
-    buildCommand: |
-      echo "window.API_BASE = '${API_BASE}';" > frontend/src/env.js
+    buildCommand: ""
     staticPublishPath: frontend/src
     envVars:
       - key: API_BASE
         value: https://villages-tracker-api.onrender.com
+    generateEnvFile: true
 
   - type: cron
     name: villages-tracker-cron
