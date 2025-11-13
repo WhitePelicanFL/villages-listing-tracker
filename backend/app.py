@@ -124,78 +124,92 @@ def scrape_listings() -> List[Dict]:
     driver = make_driver()
 
     try:
-        driver.get(HOMEFINDER_URL + "?view=list")
-        logger.info("Loaded HOMEFINDER page… waiting for listings…")
+        logger.info("Loading Homefinder list view…")
+        driver.get("https://www.thevillages.com/homefinder/#/homes?view=list")
 
-        # Wait up to 20 seconds for FIRST listing card to appear
+        # Give Angular router time to bootstrap
+        time.sleep(5)
+
+        # Wait for ANY property cards to appear
         try:
-            WebDriverWait(driver, 20).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "md-card.propertyCard"))
+            WebDriverWait(driver, 25).until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, "md-card.propertyCard, md-card._md")
+                )
             )
-            logger.info("List view detected — cards are loading.")
-        except Exception:
-            logger.error("ERROR: Listing cards NEVER appeared — returning empty list.")
+            logger.info("Listing cards detected.")
+        except:
+            logger.error("ERROR: No listing cards ever appeared.")
             return []
 
-        time.sleep(2)  # give Angular time to render additional cards
+        time.sleep(2)
 
-        # Scroll to load all results
+        # Scroll until no new cards appear
         cards_seen = 0
-        scroll_attempts = 0
+        attempts = 0
 
         while True:
-            cards = driver.find_elements(By.CSS_SELECTOR, "md-card.propertyCard")
+            cards = driver.find_elements(
+                By.CSS_SELECTOR, "md-card.propertyCard, md-card._md"
+            )
+
             if len(cards) == cards_seen:
-                scroll_attempts += 1
-                if scroll_attempts > 3:
+                attempts += 1
+                if attempts >= 4:
                     break
             else:
-                scroll_attempts = 0
+                attempts = 0
                 cards_seen = len(cards)
 
-            driver.execute_script("window.scrollBy(0, 800);")
-            time.sleep(1)
+            driver.execute_script("window.scrollBy(0, 1200);")
+            time.sleep(1.2)
 
-        logger.info(f"Total cards found: {cards_seen}")
+        logger.info(f"Total md-card elements detected: {cards_seen}")
 
         results = []
+
         for c in cards:
             try:
                 full_text = c.text
                 lower = full_text.lower()
 
-                # status
+                # Listing status
                 status = "active"
                 if "pending" in lower or "under contract" in lower:
                     status = "pending"
 
-                # type
+                # New home vs preowned
                 list_type = "preowned"
                 if "new home" in lower or "model" in lower:
                     list_type = "new"
 
-                # village parsing
+                # Village extraction
                 village = ""
                 try:
-                    village_el = c.find_element(By.CSS_SELECTOR, ".prop_village, .ng-binding")
+                    village_el = c.find_element(By.CSS_SELECTOR, ".prop_village")
                     village = village_el.text.strip()
                 except:
-                    pass
+                    # Fallback heuristic
+                    for line in full_text.splitlines():
+                        if "village" in line.lower():
+                            village = line.strip()
+                            break
 
                 region = classify_region(village)
 
                 results.append({
-                    "title": full_text[:120],
+                    "title": full_text[:150],
                     "status": status,
                     "type": list_type,
                     "village": village,
                     "region": region
                 })
 
-            except Exception:
+            except Exception as e:
+                logger.error(f"Error parsing card: {e}")
                 continue
 
-        logger.info(f"Scraped {len(results)} listings.")
+        logger.info(f"Scraped {len(results)} listings total.")
         return results
 
     finally:
