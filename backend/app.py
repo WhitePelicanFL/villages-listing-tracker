@@ -126,98 +126,77 @@ def scrape_listings() -> List[Dict]:
     driver = make_driver()
 
     try:
+        # Load the embedded Homefinder list page directly
         url = "https://www.thevillages.com/homefinder/#/homes?view=list"
         logger.info(f"Loading URL: {url}")
         driver.get(url)
 
-        # Force AngularJS to initialize (Render headless often stalls without this)
-        driver.execute_script("""
-            window.scrollTo(0, 0);
-            document.body.dispatchEvent(new Event('mousemove'));
-            document.body.dispatchEvent(new Event('keydown'));
-        """)
-
-        time.sleep(5)  # Let Angular load scripts + router
-
-        # Try clicking the FILTER button to trigger DOM activity
+        # Wait for at least one md-card.propertyCard to load
         try:
-            filter_btn = WebDriverWait(driver, 8).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, "button.md-button"))
-            )
-            driver.execute_script("arguments[0].click();", filter_btn)
-            logger.info("Clicked a button to wake Angular.")
-            time.sleep(1)
-            driver.back()
-        except:
-            logger.info("Filter button not found — continuing anyway.")
-
-        # NOW wait for listing cards
-        try:
-            WebDriverWait(driver, 20).until(
+            WebDriverWait(driver, 25).until(
                 EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, "md-card.propertyCard, md-card._md")
+                    (By.CSS_SELECTOR, "md-card.propertyCard")
                 )
             )
-            logger.info("Listing cards appeared.")
+            logger.info("Listing cards detected — continuing scrape…")
         except Exception:
             logger.error("ERROR: No listing cards ever appeared (Angular did not render).")
-            # SAVE screenshot to debug
-            try:
-                driver.save_screenshot("/tmp/homefinder_debug.png")
-                logger.error("Screenshot saved to /tmp/homefinder_debug.png")
-            except:
-                pass
+            # Screenshot for debugging
+            driver.save_screenshot("/tmp/homefinder_debug.png")
             return []
 
         time.sleep(2)
 
-        # Scroll to get all cards
-        cards_seen = 0
-        stuck = 0
+        # Scroll until no new cards load
+        last_count = 0
+        same_count_scrolls = 0
 
         while True:
-            cards = driver.find_elements(
-                By.CSS_SELECTOR, "md-card.propertyCard, md-card._md"
-            )
+            cards = driver.find_elements(By.CSS_SELECTOR, "md-card.propertyCard")
+            count = len(cards)
 
-            if len(cards) == cards_seen:
-                stuck += 1
-                if stuck >= 4:
+            if count == last_count:
+                same_count_scrolls += 1
+                if same_count_scrolls > 3:
                     break
             else:
-                stuck = 0
-                cards_seen = len(cards)
+                last_count = count
+                same_count_scrolls = 0
 
-            driver.execute_script("window.scrollBy(0, 1400);")
-            time.sleep(1.1)
+            driver.execute_script("window.scrollBy(0, 1000);")
+            time.sleep(1)
 
-        logger.info(f"Total cards found: {cards_seen}")
+        logger.info(f"Total cards found: {last_count}")
 
-        # Extract data
         results = []
 
         for c in cards:
             try:
-                full_text = c.text
-                lower = full_text.lower()
+                full_text = c.text.lower()
 
+                # Determine pending vs active
                 status = "active"
-                if "pending" in lower or "under contract" in lower:
+                if "pending" in full_text or "contract" in full_text:
                     status = "pending"
 
-                list_type = "preowned"
-                if "new home" in lower or "model" in lower:
-                    list_type = "new"
-
-                village = ""
+                # Extract village
                 try:
                     village_el = c.find_element(By.CSS_SELECTOR, ".prop_village")
                     village = village_el.text.strip()
                 except:
-                    for line in full_text.splitlines():
-                        if "village" in line.lower():
-                            village = line.strip()
-                            break
+                    village = "Unknown"
+
+                # Extract price
+                try:
+                    price_el = c.find_element(By.CSS_SELECTOR, ".price")
+                    price = price_el.text.strip()
+                except:
+                    price = ""
+
+                # List type (new vs preowned)
+                list_type = "preowned"
+                if "model" in full_text or "new home" in full_text:
+                    list_type = "new"
 
                 region = classify_region(village)
 
@@ -226,9 +205,12 @@ def scrape_listings() -> List[Dict]:
                     "status": status,
                     "type": list_type,
                     "village": village,
-                    "region": region
+                    "region": region,
+                    "price": price,
                 })
-            except:
+
+            except Exception as e:
+                logger.error(f"Error parsing a card: {e}")
                 continue
 
         logger.info(f"Scraped {len(results)} listings.")
