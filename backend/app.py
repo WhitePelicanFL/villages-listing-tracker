@@ -14,6 +14,8 @@ import os
 import sqlite3
 import json
 import time
+import logging
+
 from datetime import datetime
 from typing import List, Dict
 
@@ -30,6 +32,10 @@ DB_PATH = os.environ.get("DB_PATH", "counts.db")
 HOMEFINDER_URL = "https://www.thevillages.com/homefinder"
 
 app = FastAPI(title="Villages Listing Tracker")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 
 # --------- Regions & village grouping (Option B: practical market regions) ---------
 
