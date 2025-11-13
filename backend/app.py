@@ -129,8 +129,7 @@ def scrape_listings() -> List[Dict]:
     try:
         driver.get(HOMEFINDER_URL)    
         time.sleep(3)
-
-    logger.info("Loaded HOMEFINDER page...")
+        logger.info("Loaded HOMEFINDER page...")
     
         # Try to locate the listing container
         try:
