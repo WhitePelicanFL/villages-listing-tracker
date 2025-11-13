@@ -124,10 +124,12 @@ def scrape_listings() -> List[Dict]:
     You will likely need to tweak CSS selectors once you inspect the live HTML.
     """
     
-    logger.info("Launching Selenium WebDriver.")
+logger.info("Launching Selenium WebDriver...")
     driver = make_driver()
     try:
         driver.get(HOMEFINDER_URL)
+logger.info("Loaded HOMEFINDER page...")
+        
         time.sleep(3)
 
         # Try to locate the listing container
@@ -201,6 +203,7 @@ def scrape_listings() -> List[Dict]:
             driver.quit()
         except Exception:
             pass
+
 
 def run_count() -> Dict:
     listings = scrape_listings()
