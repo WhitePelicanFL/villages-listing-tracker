@@ -346,6 +346,7 @@ def export_csv(days: int = 365):
 
     return StreamingResponse(iter_csv(), media_type="text/csv")
 
+
 # --------- Scheduler for daily 6 AM run ---------
 
 scheduler = BackgroundScheduler()
