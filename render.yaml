@@ -9,7 +9,9 @@ services:
   - type: web
     name: villages-tracker-web
     env: static
-    buildCommand: ""
+    buildCommand: |
+  echo "window.API_BASE = '${API_BASE}';" > frontend/src/env.js
+
     staticPublishPath: frontend/src
     envVars:
       - key: API_BASE
