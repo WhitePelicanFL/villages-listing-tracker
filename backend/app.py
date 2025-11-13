@@ -24,6 +24,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
+from fastapi.responses import FileResponse
+
 DB_PATH = os.environ.get("DB_PATH", "counts.db")
 HOMEFINDER_URL = "https://www.thevillages.com/homefinder/#/homes"
 
@@ -396,9 +398,14 @@ def export_csv(days: int = 365):
     return StreamingResponse(iter_csv(), media_type="text/csv")
 
 
+@app.get("/debug-screenshot")
+def debug_screenshot():
+    filepath = "/tmp/homefinder_debug.png"
+    if os.path.exists(filepath):
+        return FileResponse(filepath, media_type="image/png")
+    return {"error": "Screenshot not found"}
+
 # --------- Scheduler for daily 6 AM run ---------
-
-
 scheduler = BackgroundScheduler()
 scheduler.add_job(run_count, "cron", hour=6, minute=0)
 scheduler.start()
