@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+selenium
+apscheduler
+pydantic
+requests
+sqlite-utils
+python-dotenv
+aiofiles

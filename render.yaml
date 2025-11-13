@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: villages-tracker-api
+    env: python
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: uvicorn backend.app:app --host 0.0.0.0 --port 8000
+    plan: free
+
+  - type: web
+    name: villages-tracker-web
+    env: static
+    buildCommand: ""
+    staticPublishPath: frontend/src
+    envVars:
+      - key: API_BASE
+        value: https://villages-tracker-api.onrender.com
+
+  - type: cron
+    name: villages-tracker-cron
+    env: python
+    schedule: "0 6 * * *"
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: python backend/run_once.py
