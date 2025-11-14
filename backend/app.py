@@ -183,42 +183,80 @@ def make_driver():
 def parse_card(card) -> Dict:
     """
     Extract structured info from a propertyCard element.
+
+    Key points:
+    - Listing ID comes from the span whose text starts with VNH# or VLS#
+    - ID is normalized to VNH240V045 / VLS123456 (no spaces/punctuation)
+    - VNH = Villages New Homes (NEW), VLS = Villages Listing Service (PREOWNED)
     """
     full_text = card.text or ""
     lower = full_text.lower()
 
-    # VNH# as unique ID
-    vnh = ""
-    for line in full_text.splitlines():
-        line = line.strip()
-        if line.upper().startswith("VNH#"):
-            # "VNH# 243V033"
-            parts = line.replace("#", "").split()
-            if len(parts) >= 2:
-                vnh = parts[1].strip()
-            break
+    listing_id = ""
+    id_prefix = ""
 
-    # village (line that contains "The Village of")
+    # --- Primary: look for a span whose text starts with VNH# or VLS# ---
+    try:
+        spans = card.find_elements(By.CSS_SELECTOR, "span.ng-binding")
+        for span in spans:
+            txt = (span.text or "").strip()
+            if txt.startswith("VNH#") or txt.startswith("VLS#"):
+                # Example: "VNH# 240V045"
+                raw = txt.replace("#", " ")
+                parts = raw.split()
+                # parts -> ["VNH", "240V045"]
+                if len(parts) >= 2:
+                    id_prefix = parts[0].upper()
+                    id_body = parts[1].strip()
+                    listing_id = f"{id_prefix}{id_body}"
+                    break
+    except Exception as e:
+        logger.debug("Error extracting VNH/VLS span: %s", e)
+
+    # --- Fallback: scan text lines for VNH#/VLS# if we didn't find via span ---
+    if not listing_id:
+        for line in full_text.splitlines():
+            line_stripped = line.strip()
+            upper = line_stripped.upper()
+            if upper.startswith("VNH#") or upper.startswith("VLS#"):
+                raw = line_stripped.replace("#", " ")
+                parts = raw.split()
+                if len(parts) >= 2:
+                    id_prefix = parts[0].upper()
+                    id_body = parts[1].strip()
+                    listing_id = f"{id_prefix}{id_body}"
+                break
+
+    # --- Listing type: based on prefix (your authoritative rule) ---
+    # VNH = Villages New Homes (new construction)
+    # VLS = Villages Listing Service (preowned resale)
+    if id_prefix == "VNH":
+        list_type = "new"
+    elif id_prefix == "VLS":
+        list_type = "preowned"
+    else:
+        # fallback: infer from text if prefix missing
+        if "new home" in lower or "model" in lower:
+            list_type = "new"
+        else:
+            list_type = "preowned"
+
+    # --- Village: line containing "Village of" ---
     village = ""
     for line in full_text.splitlines():
         if "village of" in line.lower():
             village = line.strip()
             break
 
-    # status: default active, look for "pending" text
+    # --- Status: active vs pending ---
     status = "active"
     if "pending" in lower or "under contract" in lower:
         status = "pending"
 
-    # type: new vs preowned
-    list_type = "preowned"
-    if "new home" in lower or "model" in lower:
-        list_type = "new"
-
     region = classify_region(village)
 
     return {
-        "id": vnh or full_text[:40],
+        "id": listing_id or full_text[:40],
         "title": full_text[:120],
         "status": status,
         "type": list_type,
@@ -231,11 +269,9 @@ def scrape_listings() -> List[Dict]:
     """
     Core scraping logic.
 
-    Key change vs earlier versions:
-    - The list uses md-virtual-repeat, so only ~10–15 cards exist
-      in the DOM at once.
-    - We now harvest cards on *every scroll* and deduplicate by VNH#
-      so we accumulate the full set of listings.
+    The list uses md-virtual-repeat, so only a subset of cards exists
+    in the DOM at once. We harvest cards on every scroll and deduplicate
+    by the VNH/VLS listing ID so we accumulate the full set.
     """
     logger.info("Launching Selenium WebDriver...")
     driver = make_driver()
@@ -258,37 +294,55 @@ def scrape_listings() -> List[Dict]:
             )
             return []
 
+        # small extra wait for stability
         time.sleep(2)
+
+        # Try to locate the md-virtual-repeat-container itself for targeted scrolling
+        container = None
+        try:
+            container = WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, "md-virtual-repeat-container")
+                )
+            )
+            logger.info(
+                "Found md-virtual-repeat-container – will scroll inside it for virtual list."
+            )
+        except Exception:
+            logger.warning(
+                "md-virtual-repeat-container not found – falling back to window scroll."
+            )
 
         seen_ids = set()
         results: List[Dict] = []
 
         same_count_loops = 0
-        max_same_loops = 8  # safety to exit once we've seen everything
+        max_same_loops = 12  # a bit higher to be safe with async loading
 
         while True:
             cards = driver.find_elements(By.CSS_SELECTOR, "md-card.propertyCard")
+            logger.debug("Currently %d cards in DOM.", len(cards))
 
             new_this_round = 0
             for card in cards:
                 try:
                     data = parse_card(card)
-                    uid = data["id"]
+                    uid = data.get("id") or ""
                     if not uid:
-                        # no stable ID, skip
                         continue
                     if uid in seen_ids:
                         continue
                     seen_ids.add(uid)
                     results.append(data)
                     new_this_round += 1
-                except Exception:
-                    # ignore parsing errors for individual cards
+                except Exception as e:
+                    logger.debug("Error parsing card: %s", e, exc_info=True)
                     continue
 
             logger.info(
-                "Harvest loop: saw %d cards, total unique so far: %d",
+                "Harvest loop: saw %d cards, new this round: %d, total unique so far: %d",
                 len(cards),
+                new_this_round,
                 len(results),
             )
 
@@ -298,11 +352,24 @@ def scrape_listings() -> List[Dict]:
                 same_count_loops = 0
 
             if same_count_loops >= max_same_loops:
-                logger.info("No new cards for several loops – assuming end of list.")
+                logger.info(
+                    "No new cards for %d consecutive loops – assuming end of virtual list.",
+                    max_same_loops,
+                )
                 break
 
-            # scroll down a bit to trigger md-virtual-repeat to load more items
-            driver.execute_script("window.scrollBy(0, 900);")
+            # Scroll to trigger md-virtual-repeat to load more items
+            try:
+                if container:
+                    driver.execute_script(
+                        "arguments[0].scrollTop = arguments[0].scrollTop + 800;",
+                        container,
+                    )
+                else:
+                    driver.execute_script("window.scrollBy(0, 900);")
+            except Exception as e:
+                logger.warning("Scroll attempt failed: %s", e)
+
             time.sleep(1.0)
 
         logger.info("Scraped %d listings in total.", len(results))
