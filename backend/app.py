@@ -1,25 +1,21 @@
 """
-Villages Listing Tracker (FINAL VERSION)
+Villages Listing Tracker backend
 
-This scraper loads the REAL homefinder SPA backend directly:
-    https://development.avengers.thevillages.com/homefinder/?hideHeader
-
-This bypasses the WordPress wrapper and allows full access
-to all listing cards, new + preowned, active + pending.
+Run locally:
+    uvicorn app:app --reload --host 0.0.0.0 --port 8000
 """
 
 import os
+import sqlite3
 import json
 import time
-import sqlite3
 import logging
 from datetime import datetime
 from typing import List, Dict
 
 from fastapi import FastAPI, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-
+from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from selenium import webdriver
@@ -28,50 +24,102 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-
-# --------------------------------------------
-# CONFIG
-# --------------------------------------------
+# -------------------------------------------------
+# Config
+# -------------------------------------------------
 
 DB_PATH = os.environ.get("DB_PATH", "counts.db")
 
-# **REAL backend SPA that contains ALL listings**
+# Homefinder SPA (no WordPress wrapper, no homesites)
+# new & preowned & status (for-sale) only; hide header to reduce clutter
 HOMEFINDER_URL = (
-    "https://development.avengers.thevillages.com/homefinder/?hideHeader"
+    "https://development.avengers.thevillages.com/homefinder/"
+    "?new&preowned&status&hideHeader"
+)
+
+app = FastAPI(title="Villages Listing Tracker")
+
+# CORS so frontend on another domain can call this API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # you can tighten this later
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-# --------------------------------------------
-# REGION MAPPING
-# --------------------------------------------
+# -------------------------------------------------
+# Regions & village grouping
+# -------------------------------------------------
 
 REGION_DEFS = {
     "North of 466": [
-        "Orange Blossom Gardens", "Silver Lake", "Spanish Springs",
-        "Santo Domingo", "Rio Grande", "La Reynalda", "La Zamora",
-        "La Crescenta", "Chula Vista", "El Cortez", "El Santiago"
+        "Orange Blossom Gardens",
+        "Silver Lake",
+        "Spanish Springs",
+        "Santo Domingo",
+        "Rio Grande",
+        "La Reynalda",
+        "La Zamora",
+        "La Crescenta",
+        "Chula Vista",
+        "El Cortez",
+        "El Santiago",
+        "El Cortez",
     ],
     "Between 466 & 466A": [
-        "Belvedere", "Ashland", "Amelia", "Bonnybrook", "Liberty Park",
-        "Hadley", "Hemingway", "Duval", "Caroline", "Mallory Square",
-        "Sabastian", "Sunset Pointe", "Virginia Trace",
-        "Lake Sumter Landing"
+        "Belvedere",
+        "Ashland",
+        "Amelia",
+        "Bonnybrook",
+        "Liberty Park",
+        "Hadley",
+        "Hemingway",
+        "Duval",
+        "Caroline",
+        "Mallory Square",
+        "Sabastian",
+        "Sunset Pointe",
+        "Virginia Trace",
+        "Lake Sumter Landing",
     ],
     "South of 466A": [
-        "St. Charles", "St. James", "Tamarind Grove", "Buttonwood",
-        "Sanibel", "Hillsborough", "Collier", "Pinellas", "Charlotte"
+        "St. Charles",
+        "St. James",
+        "Tamarind Grove",
+        "Buttonwood",
+        "St. James",
+        "Sanibel",
+        "Hillsborough",
+        "Collier",
+        "Pinellas",
+        "Charlotte",
     ],
     "South of 44": [
-        "Fenney", "DeLuna", "Marsh Bend", "Chitty Chatty", "Bradford",
-        "Citrus Grove", "Hawkins", "Linden", "Monarch Grove",
-        "St. Catherine", "St. Johns", "St. Lucy", "Lake Denham", "Dabney"
+        "Fenney",
+        "DeLuna",
+        "Marsh Bend",
+        "Chitty Chatty",
+        "Bradford",
+        "Citrus Grove",
+        "Hawkins",
+        "Linden",
+        "Monarch Grove",
+        "St. Catherine",
+        "St. Johns",
+        "St. Lucy",
+        "Lake Denham",
+        "Dabney",
     ],
     "New Southern / Future": [
-        "Eastport", "Newell", "Lake Denham East", "Future Development"
-    ]
+        "Eastport",
+        "Newell",
+        "Lake Denham East",
+        "Future Development",
+    ],
 }
 
 
@@ -83,21 +131,24 @@ def classify_region(village: str) -> str:
         for name in villages:
             if name.lower() in v:
                 return region
+    # simple keyword fallbacks
     if "denham" in v:
         return "South of 44"
-    if any(x in v for x in ["dabney", "eastport", "newell"]):
+    if "dabney" in v or "eastport" in v or "newell" in v:
         return "New Southern / Future"
     return "Unknown"
 
 
-# --------------------------------------------
-# DB INIT
-# --------------------------------------------
+# -------------------------------------------------
+# DB helpers
+# -------------------------------------------------
+
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("""
+    c.execute(
+        """
         CREATE TABLE IF NOT EXISTS daily_counts (
             id INTEGER PRIMARY KEY,
             run_at TEXT,
@@ -105,188 +156,218 @@ def init_db():
             total_pending INTEGER,
             payload_json TEXT
         )
-    """)
+        """
+    )
     conn.commit()
     conn.close()
 
 
 init_db()
 
+# -------------------------------------------------
+# Selenium helpers & scraping
+# -------------------------------------------------
 
-# --------------------------------------------
-# SELENIUM DRIVER
-# --------------------------------------------
 
 def make_driver():
-    opt = Options()
-    opt.add_argument("--headless=new")
-    opt.add_argument("--no-sandbox")
-    opt.add_argument("--disable-gpu")
-    opt.add_argument("--disable-dev-shm-usage")
-    opt.add_argument("--window-size=1920,1080")
-    return webdriver.Chrome(options=opt)
+    chrome_options = Options()
+    chrome_options.add_argument("--headless=new")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--window-size=1920,1080")
+    driver = webdriver.Chrome(options=chrome_options)
+    return driver
 
 
-# --------------------------------------------
-# SCRAPING LOGIC
-# --------------------------------------------
+def parse_card(card) -> Dict:
+    """
+    Extract structured info from a propertyCard element.
+    """
+    full_text = card.text or ""
+    lower = full_text.lower()
+
+    # VNH# as unique ID
+    vnh = ""
+    for line in full_text.splitlines():
+        line = line.strip()
+        if line.upper().startswith("VNH#"):
+            # "VNH# 243V033"
+            parts = line.replace("#", "").split()
+            if len(parts) >= 2:
+                vnh = parts[1].strip()
+            break
+
+    # village (line that contains "The Village of")
+    village = ""
+    for line in full_text.splitlines():
+        if "village of" in line.lower():
+            village = line.strip()
+            break
+
+    # status: default active, look for "pending" text
+    status = "active"
+    if "pending" in lower or "under contract" in lower:
+        status = "pending"
+
+    # type: new vs preowned
+    list_type = "preowned"
+    if "new home" in lower or "model" in lower:
+        list_type = "new"
+
+    region = classify_region(village)
+
+    return {
+        "id": vnh or full_text[:40],
+        "title": full_text[:120],
+        "status": status,
+        "type": list_type,
+        "village": village,
+        "region": region,
+    }
+
 
 def scrape_listings() -> List[Dict]:
-    logger.info("Launching Selenium WebDriver…")
+    """
+    Core scraping logic.
+
+    Key change vs earlier versions:
+    - The list uses md-virtual-repeat, so only ~10–15 cards exist
+      in the DOM at once.
+    - We now harvest cards on *every scroll* and deduplicate by VNH#
+      so we accumulate the full set of listings.
+    """
+    logger.info("Launching Selenium WebDriver...")
     driver = make_driver()
 
     try:
-        # Load REAL backend
-        logger.info(f"Loading Homefinder SPA: {HOMEFINDER_URL}")
+        logger.info(f"Loading Homefinder URL: {HOMEFINDER_URL}")
         driver.get(HOMEFINDER_URL)
 
-        # Sort: Price Low → High (makes scrolling deterministic)
+        # Wait for at least one propertyCard to appear
         try:
-            sort_dropdown = WebDriverWait(driver, 20).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, "md-select[label='Sort By']"))
+            WebDriverWait(driver, 30).until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, "md-card.propertyCard")
+                )
             )
-            sort_dropdown.click()
-            option = WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, "md-option[value='priceLowToHigh']"))
+            logger.info("First listing card detected – starting scroll harvesting.")
+        except Exception:
+            logger.error(
+                "ERROR: No listing cards ever appeared – returning empty list."
             )
-            option.click()
-            time.sleep(1)
-            logger.info("Sorting set to Price Low → High")
-        except:
-            logger.warning("Sort dropdown not found — continuing anyway.")
+            return []
 
-        # Homesites OFF
-        try:
-            homesite_toggle = driver.find_element(
-                By.CSS_SELECTOR, "md-switch[aria-label='Homesites']"
-            )
-            if "md-checked" in homesite_toggle.get_attribute("class"):
-                homesite_toggle.click()
-                logger.info("Homesites turned OFF.")
-        except:
-            logger.warning("Homesites toggle not found — continuing.")
+        time.sleep(2)
 
-        # Wait for first card
-        logger.info("Waiting for listing cards…")
-        WebDriverWait(driver, 25).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "md-card.propertyCard"))
-        )
-        time.sleep(1)
+        seen_ids = set()
+        results: List[Dict] = []
 
-        # Scroll virtual repeat to load ALL cards
-        logger.info("Scrolling through virtual list…")
-        SCROLL_JS = """
-            var scroller = document.querySelector('.md-virtual-repeat-scroller');
-            if (!scroller) return false;
-            scroller.scrollTop = scroller.scrollHeight;
-            return scroller.scrollHeight;
-        """
-
-        last_height = 0
-        stable_count = 0
+        same_count_loops = 0
+        max_same_loops = 8  # safety to exit once we've seen everything
 
         while True:
-            height = driver.execute_script(SCROLL_JS)
-            cards_now = len(driver.find_elements(By.CSS_SELECTOR, "md-card.propertyCard"))
+            cards = driver.find_elements(By.CSS_SELECTOR, "md-card.propertyCard")
 
-            if height == last_height:
-                stable_count += 1
+            new_this_round = 0
+            for card in cards:
+                try:
+                    data = parse_card(card)
+                    uid = data["id"]
+                    if not uid:
+                        # no stable ID, skip
+                        continue
+                    if uid in seen_ids:
+                        continue
+                    seen_ids.add(uid)
+                    results.append(data)
+                    new_this_round += 1
+                except Exception:
+                    # ignore parsing errors for individual cards
+                    continue
+
+            logger.info(
+                "Harvest loop: saw %d cards, total unique so far: %d",
+                len(cards),
+                len(results),
+            )
+
+            if new_this_round == 0:
+                same_count_loops += 1
             else:
-                stable_count = 0
+                same_count_loops = 0
 
-            if stable_count >= 3:
+            if same_count_loops >= max_same_loops:
+                logger.info("No new cards for several loops – assuming end of list.")
                 break
 
-            last_height = height
-            time.sleep(1)
+            # scroll down a bit to trigger md-virtual-repeat to load more items
+            driver.execute_script("window.scrollBy(0, 900);")
+            time.sleep(1.0)
 
-        cards = driver.find_elements(By.CSS_SELECTOR, "md-card.propertyCard")
-        logger.info(f"Total cards found: {len(cards)}")
-
-        # Extract listing info
-        results = []
-        for c in cards:
-            txt = c.text.lower()
-
-            status = (
-                "pending" if ("pending" in txt or "under contract" in txt) else "active"
-            )
-
-            list_type = (
-                "new" if ("model" in txt or "new home" in txt) else "preowned"
-            )
-
-            village = ""
-            try:
-                v = c.find_element(By.CSS_SELECTOR, ".prop_village, .ng-binding")
-                village = v.text.strip()
-            except:
-                pass
-
-            region = classify_region(village)
-
-            results.append({
-                "status": status,
-                "type": list_type,
-                "village": village,
-                "region": region,
-                "raw": c.text
-            })
-
-        logger.info(f"Scraped {len(results)} listings.")
+        logger.info("Scraped %d listings in total.", len(results))
         return results
 
     finally:
         try:
             driver.quit()
-        except:
+        except Exception:
             pass
 
-
-# --------------------------------------------
-# RUN COUNT
-# --------------------------------------------
 
 def run_count() -> Dict:
     listings = scrape_listings()
 
-    total_active = sum(1 for r in listings if r["status"] == "active")
-    total_pending = sum(1 for r in listings if r["status"] == "pending")
+    total_active = sum(
+        1 for r in listings if r.get("status", "").lower() == "active"
+    )
+    total_pending = sum(
+        1 for r in listings if r.get("status", "").lower() == "pending"
+    )
 
-    # Group by region → village
-    grouped = {}
+    # group by region and then village (alphabetical inside region)
+    grouped: Dict[str, Dict[str, Dict[str, int]]] = {}
     for r in listings:
-        reg = r["region"]
-        vil = r["village"] or "Unknown"
-        status = r["status"]
+        region = r.get("region") or classify_region(r.get("village", ""))
+        village = r.get("village") or "Unknown"
+        status = r.get("status", "active").lower()
 
-        region_dict = grouped.setdefault(reg, {})
+        region_dict = grouped.setdefault(region, {})
         village_dict = region_dict.setdefault(
-            vil, {"active": 0, "pending": 0, "total": 0}
+            village, {"active": 0, "pending": 0, "total": 0}
         )
 
-        village_dict[status] += 1
+        if status == "active":
+            village_dict["active"] += 1
+        elif status == "pending":
+            village_dict["pending"] += 1
         village_dict["total"] += 1
 
-    grouped_sorted = {
-        region: dict(sorted(villages.items()))
-        for region, villages in grouped.items()
-    }
+    # sort villages inside each region alphabetically
+    grouped_sorted: Dict[str, Dict[str, Dict[str, int]]] = {}
+    for region, villages in grouped.items():
+        grouped_sorted[region] = dict(sorted(villages.items(), key=lambda kv: kv[0]))
 
     row = {
         "run_at": datetime.utcnow().isoformat(),
         "total_active": total_active,
         "total_pending": total_pending,
-        "grouped": grouped_sorted
+        "grouped": grouped_sorted,
     }
 
-    # Save raw listings
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        "INSERT INTO daily_counts(run_at, total_active, total_pending, payload_json) "
-        "VALUES (?, ?, ?, ?)",
-        (row["run_at"], total_active, total_pending, json.dumps(listings))
+        """
+        INSERT INTO daily_counts(run_at, total_active, total_pending, payload_json)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            row["run_at"],
+            row["total_active"],
+            row["total_pending"],
+            json.dumps(listings),
+        ),
     )
     conn.commit()
     conn.close()
@@ -294,19 +375,9 @@ def run_count() -> Dict:
     return row
 
 
-# --------------------------------------------
-# FASTAPI APP
-# --------------------------------------------
-
-app = FastAPI(title="Villages Listing Tracker (VLT)")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-    allow_credentials=True,
-)
+# -------------------------------------------------
+# API endpoints
+# -------------------------------------------------
 
 
 @app.get("/status")
@@ -314,65 +385,64 @@ def status():
     return {"status": "ok"}
 
 
-def debug_run():
-    logger.info("Background task started…")
+def debug_run_count():
+    logger.info("Background task started.")
     try:
         result = run_count()
         logger.info(
-            f"Completed. {result['total_active']} active, {result['total_pending']} pending."
+            "Background task completed successfully. Result summary: "
+            f"{result.get('total_active')} active, "
+            f"{result.get('total_pending')} pending."
         )
     except Exception as e:
-        logger.error(f"run_count failed: {e}", exc_info=True)
+        logger.error(f"Error during run_count(): {str(e)}", exc_info=True)
 
 
 @app.post("/run")
 def trigger_run(background_tasks: BackgroundTasks):
-    background_tasks.add_task(debug_run)
-    return {"status": "started"}
+    logger.info("RUN endpoint received request — starting background task.")
+    background_tasks.add_task(debug_run_count)
+    return JSONResponse({"status": "started"})
 
 
 @app.get("/latest")
 def latest():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute(
-        "SELECT run_at, total_active, total_pending, payload_json "
-        "FROM daily_counts ORDER BY id DESC LIMIT 1"
-    )
+    c.execute("SELECT * FROM daily_counts ORDER BY id DESC LIMIT 1")
     row = c.fetchone()
     conn.close()
-
     if not row:
         return {}
+    _id, run_at, total_active, total_pending, payload_json = row
 
-    run_at, active, pending, payload = row
-    listings = json.loads(payload)
-
-    # regroup on-the-fly
-    grp = {}
+    listings = json.loads(payload_json)
+    grouped: Dict[str, Dict[str, Dict[str, int]]] = {}
     for r in listings:
-        reg = r["region"]
-        vil = r["village"] or "Unknown"
-        stat = r["status"]
+        region = r.get("region") or classify_region(r.get("village", ""))
+        village = r.get("village") or "Unknown"
+        status = r.get("status", "active").lower()
 
-        region_dict = grp.setdefault(reg, {})
+        region_dict = grouped.setdefault(region, {})
         village_dict = region_dict.setdefault(
-            vil, {"active": 0, "pending": 0, "total": 0}
+            village, {"active": 0, "pending": 0, "total": 0}
         )
 
-        village_dict[stat] += 1
+        if status == "active":
+            village_dict["active"] += 1
+        elif status == "pending":
+            village_dict["pending"] += 1
         village_dict["total"] += 1
 
-    grp_sorted = {
-        reg: dict(sorted(vill.items()))
-        for reg, vill in grp.items()
-    }
+    grouped_sorted: Dict[str, Dict[str, Dict[str, int]]] = {}
+    for region, villages in grouped.items():
+        grouped_sorted[region] = dict(sorted(villages.items(), key=lambda kv: kv[0]))
 
     return {
         "run_at": run_at,
-        "total_active": active,
-        "total_pending": pending,
-        "grouped": grp_sorted,
+        "total_active": total_active,
+        "total_pending": total_pending,
+        "grouped": grouped_sorted,
     }
 
 
@@ -383,15 +453,12 @@ def history(days: int = 30):
     c.execute(
         "SELECT run_at, total_active, total_pending "
         "FROM daily_counts ORDER BY id DESC LIMIT ?",
-        (days,)
+        (days,),
     )
     rows = c.fetchall()
     conn.close()
-
-    return {"data": [
-        {"run_at": r[0], "active": r[1], "pending": r[2]}
-        for r in rows
-    ]}
+    data = [{"run_at": r[0], "active": r[1], "pending": r[2]} for r in rows]
+    return {"data": data}
 
 
 @app.get("/export.csv")
@@ -401,28 +468,28 @@ def export_csv(days: int = 365):
     c.execute(
         "SELECT run_at, total_active, total_pending "
         "FROM daily_counts ORDER BY id DESC LIMIT ?",
-        (days,)
+        (days,),
     )
     rows = c.fetchall()
     conn.close()
 
-    def iter_rows():
+    def iter_csv():
         yield "run_at,total_active,total_pending\n"
         for r in rows:
             yield f"{r[0]},{r[1]},{r[2]}\n"
 
-    return StreamingResponse(iter_rows(), media_type="text/csv")
+    return StreamingResponse(iter_csv(), media_type="text/csv")
 
 
-# --------------------------------------------
-# Daily 6 AM scheduler
-# --------------------------------------------
+# -------------------------------------------------
+# Scheduler for daily 6 AM run
+# -------------------------------------------------
 
 scheduler = BackgroundScheduler()
-scheduler.add_job(debug_run, "cron", hour=6, minute=0)
+scheduler.add_job(run_count, "cron", hour=6, minute=0)
 scheduler.start()
-
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
