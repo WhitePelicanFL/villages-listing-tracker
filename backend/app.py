@@ -252,7 +252,7 @@ def parse_card(card) -> Dict:
             break
 
     # If no usable ID, this is not a real listing → skip
-    logger.info("uid = #", uid, "#")
+    logger.info("uid = %s", uid)
     if not uid or uid == "" or uid.startswith("VNH") is False and uid.startswith("VLS") is False:
         return {"id": "", "skip": True}
 
