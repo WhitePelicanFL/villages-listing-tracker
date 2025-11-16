@@ -385,9 +385,9 @@ def scrape_listings() -> List[Dict]:
             for card in cards:
                 try:
                     data = parse_card(card)
-                    uid = data["id"]
-                    if not uid:
+                    if data.get("skip"):
                         continue
+                    uid = data["id"]
                     if uid in seen_ids:
                         continue
                     seen_ids.add(uid)
