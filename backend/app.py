@@ -251,9 +251,9 @@ def parse_card(card) -> Dict:
                 list_type = id_info["type"]
             break
 
-    # If we couldn't find VNH/VLS, fall back to a generic id from text
-    if not uid:
-        uid = full_text[:40]
+    # If no usable ID, this is not a real listing → skip
+    if not uid or uid == "" or uid.startswith("VNH") is False and uid.startswith("VLS") is False:
+        return {"id": "", "skip": True}
 
     # -------------------------------------------------
     # Village (line that contains "The Village of")
