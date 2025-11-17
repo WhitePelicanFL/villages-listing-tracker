@@ -33,14 +33,18 @@ from selenium.webdriver.support import expected_conditions as EC
 VILLAGES_LAT = 28.872325543285804
 VILLAGES_LNG = -81.99806323437654
 
-# homesites=false removes lot-only listings
-HOMEFINDER_URL = (
+# Base URL: production Homefinder, zoomed out over the Villages,
+# homesites turned OFF, header hidden. We will add ?new or ?preowned
+# per pass so we scrape both feeds separately.
+HOMEFINDER_BASE_URL = (
     "https://www.thevillages.com/homefinder/"
     f"?lat={VILLAGES_LAT}&lng={VILLAGES_LNG}&lvl=1"
-    "&new&preowned&status"
     "&homesites=false"
     "&hideHeader"
 )
+
+HOMEFINDER_URL_NEW = HOMEFINDER_BASE_URL + "&new"
+HOMEFINDER_URL_PREOWNED = HOMEFINDER_BASE_URL + "&preowned"
 
 DB_PATH = os.environ.get("DB_PATH", "counts.db")
 
@@ -387,13 +391,17 @@ def switch_into_iframe_if_present(driver):
 # SCRAPE LISTINGS — MAIN HARVEST LOOP
 # -------------------------------------------------
 
-def scrape_listings() -> List[Dict]:
+def scrape_listings_for_url(url: str) -> List[Dict]:
+    """
+    Scrape a single Homefinder feed (either NEW or PREOWNED), given a URL.
+    We will call this twice: once for &new, once for &preowned.
+    """
     logger.info("Launching WebDriver…")
     driver = make_driver()
 
     try:
-        logger.info(f"Loading Homefinder URL: {HOMEFINDER_URL}")
-        driver.get(HOMEFINDER_URL)
+        logger.info(f"Loading Homefinder URL: {url}")
+        driver.get(url)
 
         time.sleep(2)
         switch_into_iframe_if_present(driver)
@@ -415,16 +423,15 @@ def scrape_listings() -> List[Dict]:
         results: List[Dict] = []
 
         sample_dumped = False
-        
         same_loops = 0
         max_same = 10
 
         while True:
             cards = driver.find_elements(By.CSS_SELECTOR, "md-card.propertyCard")
 
-            # DEBUG: dump first 3 cards' text once so we see raw content
+            # DEBUG: dump raw text of first 3 cards once per URL
             if not sample_dumped:
-                logger.info("DEBUG: dumping text of first 3 cards")
+                logger.info("DEBUG: dumping text of first 3 cards for this URL")
                 for c in cards[:3]:
                     try:
                         logger.info("CARD TEXT:\n%s\n---", c.text)
@@ -447,7 +454,10 @@ def scrape_listings() -> List[Dict]:
                     continue
 
             logger.info(
-                f"Harvest loop: cards={len(cards)}, total={len(results)}, new={new_count}"
+                "Harvest loop: cards=%d, total=%d, new=%d",
+                len(cards),
+                len(results),
+                new_count,
             )
 
             if new_count == 0:
@@ -456,24 +466,69 @@ def scrape_listings() -> List[Dict]:
                 same_loops = 0
 
             if same_loops >= max_same:
-                logger.info("Reached end of listing panel — stopping scroll.")
+                logger.info("Reached end of listing panel for this URL — stopping scroll.")
                 break
 
-            # Scroll by one viewport height
             driver.execute_script(
                 "arguments[0].scrollTop = arguments[0].scrollTop + arguments[0].clientHeight;",
                 scroll_container,
             )
             time.sleep(1.0)
 
-        logger.info(f"Scraped {len(results)} listings total.")
+        logger.info(f"Scraped {len(results)} listings total from {url}.")
         return results
 
     finally:
         try:
             driver.quit()
-        except:
+        except Exception:
             pass
+
+def scrape_listings() -> List[Dict]:
+    """
+    Dual-feed scraper:
+      • Pass 1: NEW homes (&new)
+      • Pass 2: PREOWNED homes (&preowned)
+    We merge the two result sets and dedupe by ID.
+    """
+    all_results: List[Dict] = []
+    seen_ids = set()
+
+    for label, url in [
+        ("NEW", HOMEFINDER_URL_NEW),
+        ("PREOWNED", HOMEFINDER_URL_PREOWNED),
+    ]:
+        try:
+            logger.info(f"Starting scrape pass for {label} homes.")
+            results = scrape_listings_for_url(url)
+
+            for r in results:
+                uid = r.get("id")
+                if not uid:
+                    continue
+                if uid in seen_ids:
+                    continue
+                seen_ids.add(uid)
+                all_results.append(r)
+
+            logger.info(
+                "Completed %s pass: %d listings (combined total so far: %d)",
+                label,
+                len(results),
+                len(all_results),
+            )
+        except Exception as e:
+            logger.error(
+                "Error scraping %s homes from %s: %s",
+                label,
+                url,
+                e,
+                exc_info=True,
+            )
+
+    logger.info("FINAL combined scraped listings: %d total.", len(all_results))
+    return all_results
+
 # -------------------------------------------------
 # RUN COUNT — aggregate results + store to DB
 # -------------------------------------------------
