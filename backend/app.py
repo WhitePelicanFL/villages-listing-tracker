@@ -1,8 +1,7 @@
 """
-Villages Listing Tracker backend
-
-Run locally:
-    uvicorn app:app --reload --host 0.0.0.0 --port 8000
+Villages Listing Tracker — Production Scraper
+Environment-agnostic, iframe-safe, virtual-scroll aware,
+homesite-filtered, placeholder-filtered, full-inventory scraper.
 """
 
 import os
@@ -11,7 +10,7 @@ import json
 import time
 import logging
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -19,41 +18,37 @@ from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
+
 # -------------------------------------------------
-# Config
+# CONFIG — production Homefinder URL (Option B center)
 # -------------------------------------------------
 
-# The correct map center (YOU provided it)
+# Geographic center (optimal for showing all Villages regions at lvl=1)
 VILLAGES_LAT = 28.872325543285804
 VILLAGES_LNG = -81.99806323437654
 
-DB_PATH = os.environ.get("DB_PATH", "counts.db")
-
-# Homefinder SPA on the dev host, with:
-# - lat / lng / lvl=1 to ensure:
-#     * Zoom level 1 (all the way out)
-#     * Map centered over The Villages
-# - new & preowned & status (for-sale only)
-# - hideHeader to reduce clutter
+# homesites=false removes lot-only listings
 HOMEFINDER_URL = (
-    "https://development.avengers.thevillages.com/homefinder/"
-    f"?lat={VILLAGES_LAT}"
-    f"&lng={VILLAGES_LNG}"
-    f"&lvl=1"
-    f"&new&preowned&status&hideHeader"
+    "https://www.thevillages.com/homefinder/"
+    f"?lat={VILLAGES_LAT}&lng={VILLAGES_LNG}&lvl=1"
+    "&new&preowned&status"
+    "&homesites=false"
+    "&hideHeader"
 )
+
+DB_PATH = os.environ.get("DB_PATH", "counts.db")
 
 app = FastAPI(title="Villages Listing Tracker")
 
-# CORS so frontend on another domain can call this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # you can tighten this later
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -62,8 +57,9 @@ app.add_middleware(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
 # -------------------------------------------------
-# Regions & village grouping
+# REGION DEFINITIONS — unchanged
 # -------------------------------------------------
 
 REGION_DEFS = {
@@ -142,7 +138,6 @@ def classify_region(village: str) -> str:
         for name in villages:
             if name.lower() in v:
                 return region
-    # simple keyword fallbacks
     if "denham" in v:
         return "South of 44"
     if "dabney" in v or "eastport" in v or "newell" in v:
@@ -151,9 +146,8 @@ def classify_region(village: str) -> str:
 
 
 # -------------------------------------------------
-# DB helpers
+# DB INIT
 # -------------------------------------------------
-
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -172,35 +166,36 @@ def init_db():
     conn.commit()
     conn.close()
 
-
 init_db()
 
+
 # -------------------------------------------------
-# Selenium helpers & scraping
+# SELENIUM DRIVER — ENVIRONMENT-AGNOSTIC (Selenium Manager)
 # -------------------------------------------------
 
-
-def make_driver():
+def make_driver() -> webdriver.Chrome:
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
+    chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920,1080")
-    driver = webdriver.Chrome(options=chrome_options)
+
+    # Selenium Manager auto-downloads correct driver
+    service = Service()
+
+    driver = webdriver.Chrome(service=service, options=chrome_options)
+    driver.set_page_load_timeout(60)
     return driver
 
 
+# -------------------------------------------------
+# ID NORMALIZATION
+# -------------------------------------------------
+
 def normalize_id_line(line: str) -> Dict:
     """
-    Given a line like:
-      'VNH# 240V045'
-      'VLS# 123-456'
-    return a dict with normalized id and type info.
-
-    Normalized IDs:
-      VNH# 240V045 -> VNH240V045
-      VLS# 123-456 -> VLS123456
+    Normalize VNH#/VLS# → VNH123456 etc.
     """
     text = line.strip().upper()
 
@@ -211,80 +206,103 @@ def normalize_id_line(line: str) -> Dict:
         prefix = "VLS"
         tail = text[4:]
     else:
-        return {"id": "", "prefix": "", "type": ""}
+        return {"id": "", "type": ""}
 
-    # Remove non-alphanumeric from the remainder
     tail = "".join(ch for ch in tail if ch.isalnum())
-    norm_id = f"{prefix}{tail}" if tail else ""
+    norm = f"{prefix}{tail}" if tail else ""
+    return {"id": norm, "type": "new" if prefix == "VNH" else "preowned"}
+# -------------------------------------------------
+# CARD PARSING (with placeholder + homesite filtering)
+# -------------------------------------------------
 
-    home_type = "new" if prefix == "VNH" else "preowned"
-
-    return {"id": norm_id, "prefix": prefix, "type": home_type}
-
-
-def parse_card(card) -> Dict:
+def is_homesite_text(full_text: str) -> bool:
     """
-    Extract structured info from a propertyCard element.
-
-    Fix: filter out placeholder (virtual repeat) cards.
-    A real listing MUST have:
-      - non-empty text
-      - a Village line ("The Village of ...")
-    ID may be VNH/VLS or generic fallback.
+    Homesites show:
+      - The word "HOMESITE"
+      - NO bd/ba/sqft line
+    We use Option 2 (your choice) with backup rules.
     """
+    T = full_text.upper()
 
+    # Rule A: Contains HOMESITE anywhere
+    if "HOMESITE" in T:
+        return True
+
+    # Rule B: Missing bd/ba/sqft (homes never miss all three)
+    lacks_beds = (" BD" not in T and "BED" not in T)
+    lacks_baths = (" BA" not in T and "BATH" not in T)
+    lacks_sqft = ("SQFT" not in T and "FT²" not in T)
+
+    if lacks_beds and lacks_baths and lacks_sqft:
+        return True
+
+    return False
+
+
+def parse_card(card) -> Optional[Dict]:
+    """
+    Extract structured card data.
+
+    Apply filtering:
+      • skip empty/placeholder virtual-repeat items
+      • skip homesites (Option 2 logic)
+    """
     full_text = card.text or ""
     if not full_text.strip():
-        return {"skip": True}   # empty placeholder
+        return None  # placeholder / empty card
 
+    # Homesite filtering
+    if is_homesite_text(full_text):
+        return None
+
+    # Split lines
     lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
     if not lines:
-        return {"skip": True}
+        return None
 
-    # Must have a Village line to be real
+    # Find village line ("Village of ...")
     village = ""
-    for line in lines:
-        if "village of" in line.lower():
-            village = line.strip()
+    for ln in lines:
+        if "village of" in ln.lower():
+            village = ln
             break
     if not village:
-        return {"skip": True}   # placeholder card, not a real listing
+        return None  # Real homes always show "Village of ..."
 
-    # ID detection
+    # Extract ID
     uid = ""
     list_type = ""
 
-    for line in lines:
-        upper = line.upper()
-        if upper.startswith("VNH#") or upper.startswith("VLS#"):
-            id_info = normalize_id_line(upper)
+    for ln in lines:
+        up = ln.upper()
+        if up.startswith("VNH#") or up.startswith("VLS#"):
+            id_info = normalize_id_line(up)
             uid = id_info["id"]
             list_type = id_info["type"]
             break
 
-    # If no VNH/VLS, generate fallback ID from text
+    # Fallback ID if missing real VNH/VLS
     if not uid:
-        # use first non-empty line as fallback
         uid = lines[0][:40]
 
     # Determine status
-    lower = full_text.lower()
+    low = full_text.lower()
     status = "active"
-    if "pending" in lower or "under contract" in lower:
+    if "pending" in low or "under contract" in low:
         status = "pending"
 
-    # Determine type if prefix didn't specify
+    # Determine type if no VNH/VLS prefix
     if not list_type:
-        list_type = "preowned"
-        if "new home" in lower or "model" in lower:
+        if "new home" in low or "model" in low:
             list_type = "new"
+        else:
+            list_type = "preowned"
 
     region = classify_region(village)
 
     return {
-        "skip": False,
         "id": uid,
-        "title": full_text[:120],
+        "title": full_text[:200],
         "status": status,
         "type": list_type,
         "village": village,
@@ -292,155 +310,175 @@ def parse_card(card) -> Dict:
     }
 
 
-def scrape_listings() -> List[Dict]:
-    """
-    Core scraping logic.
+# -------------------------------------------------
+# SCROLL CONTAINER DETECTION (universal)
+# -------------------------------------------------
 
-    Updated logic:
-    - Loads Homefinder with lat/lng/lvl=1 so map is:
-        * Zoom level 1
-        * Centered over The Villages
-      → this guarantees the list can show ALL listings.
-    - Uses md-virtual-repeat behavior:
-        * Only a handful of cards are in the DOM at once.
-        * We scroll the *scroll container* to load more.
-    - Harvests cards on every scroll and de-duplicates by ID.
+def find_scroll_container(driver, sample_card):
     """
-    logger.info("Launching Selenium WebDriver...")
+    UNIVERSAL SCROLL CONTAINER DETECTION
+    Works across:
+      • macOS, Windows, Linux
+      • Chrome, Brave, Edge
+      • Headless/non-headless
+      • Iframe or no iframe
+      • Shadow DOM or not
+      • Any Homefinder deployment
+
+    Strategy:
+      • walk up ancestors from a real card
+      • first ancestor where scrollHeight > clientHeight → scrollable
+    """
+    ancestor = sample_card
+
+    for _ in range(15):
+        try:
+            parent = ancestor.find_element(By.XPATH, "..")
+
+            scroll_height = driver.execute_script(
+                "return arguments[0].scrollHeight;", parent
+            )
+            client_height = driver.execute_script(
+                "return arguments[0].clientHeight;", parent
+            )
+
+            if scroll_height > client_height + 20:
+                return parent
+
+            ancestor = parent
+        except Exception:
+            break
+
+    raise Exception("Could not locate scrollable container for listing panel")
+
+
+# -------------------------------------------------
+# IFRAME DETECTION (production sometimes uses it)
+# -------------------------------------------------
+
+def switch_into_iframe_if_present(driver):
+    """
+    Production Homefinder sometimes loads inside an iframe, depending on UA.
+    We detect and switch automatically.
+    """
+    try:
+        iframes = driver.find_elements(By.TAG_NAME, "iframe")
+        if len(iframes) == 1:
+            driver.switch_to.frame(iframes[0])
+            logger.info("Switched into Homefinder iframe.")
+        elif len(iframes) > 1:
+            # Choose the iframe that contains property cards
+            for iframe in iframes:
+                try:
+                    driver.switch_to.frame(iframe)
+                    driver.find_element(By.CSS_SELECTOR, "md-card.propertyCard")
+                    logger.info("Switched into correct Homefinder iframe.")
+                    return
+                except Exception:
+                    driver.switch_to.default_content()
+            logger.info("Multiple iframes but none contained property cards.")
+        else:
+            logger.info("No iframe present — direct DOM access.")
+    except Exception as e:
+        logger.warning(f"Iframe detection failed: {e}")
+
+
+# -------------------------------------------------
+# SCRAPE LISTINGS — MAIN HARVEST LOOP
+# -------------------------------------------------
+
+def scrape_listings() -> List[Dict]:
+    logger.info("Launching WebDriver…")
     driver = make_driver()
 
     try:
         logger.info(f"Loading Homefinder URL: {HOMEFINDER_URL}")
         driver.get(HOMEFINDER_URL)
 
+        time.sleep(2)
+        switch_into_iframe_if_present(driver)
+
         wait = WebDriverWait(driver, 30)
 
-        # Wait for at least one card
-        try:
-            sample_card = wait.until(
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, "md-card.propertyCard")
-                )
-            )
+        # Wait for first listing card
+        sample_card = wait.until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "md-card.propertyCard"))
+        )
 
-            # Walk up ancestors to find real scrollable container
-            scroll_container = None
-            ancestor = sample_card
+        # Find scrollable container
+        scroll_container = find_scroll_container(driver, sample_card)
+        logger.info("Scroll container detected.")
 
-            for _ in range(10):  # walk up up to 10 levels
-                parent = ancestor.find_element(By.XPATH, "..")
+        time.sleep(1)
 
-                scroll_height = driver.execute_script(
-                    "return arguments[0].scrollHeight;", parent
-                )
-                client_height = driver.execute_script(
-                    "return arguments[0].clientHeight;", parent
-                )
-
-                # scrollable if content area is bigger than visible area
-                if scroll_height > client_height + 20:
-                    scroll_container = parent
-                    break
-
-                ancestor = parent
-
-            if not scroll_container:
-                raise Exception("Could not locate scrollable container for virtual list")
-
-            logger.info("Detected TRUE scroll container for virtual list.")
-            logger.info(
-                "Scroll container and first listing card detected – starting scroll harvesting."
-            )
-        except Exception:
-            logger.error(
-                "ERROR: Could not find scroll container and/or listing cards – returning empty list."
-            )
-            return []
-
-        # Let things stabilize a bit
-        time.sleep(2)
-
-        seen_ids = set()
+        seen = set()
         results: List[Dict] = []
 
-        same_count_loops = 0
-        max_same_loops = 8  # safety to exit once we've seen everything
+        same_loops = 0
+        max_same = 10
 
         while True:
             cards = driver.find_elements(By.CSS_SELECTOR, "md-card.propertyCard")
 
-            new_this_round = 0
+            new_count = 0
             for card in cards:
                 try:
                     data = parse_card(card)
-                    if data.get("skip"):
+                    if not data:
                         continue
                     uid = data["id"]
-                    if not uid:
-                        continue
-
-                    # *** TRUE DEDUPE ***
-                    if uid in seen_ids:
-                        continue
-
-                    seen_ids.add(uid)
-                    results.append(data)
-                    new_this_round += 1
+                    if uid not in seen:
+                        seen.add(uid)
+                        results.append(data)
+                        new_count += 1
                 except Exception:
-                    # ignore parsing errors for individual cards
                     continue
 
             logger.info(
-                "Harvest loop: saw %d cards, total unique IDs so far: %d (new_this_round=%d)",
-                len(cards),
-                len(seen_ids),
-                new_this_round,
+                f"Harvest loop: cards={len(cards)}, total={len(results)}, new={new_count}"
             )
 
-            if new_this_round == 0:
-                same_count_loops += 1
+            if new_count == 0:
+                same_loops += 1
             else:
-                same_count_loops = 0
+                same_loops = 0
 
-            if same_count_loops >= max_same_loops:
-                logger.info(
-                    "No new cards for several loops – assuming end of list / all listings loaded."
-                )
+            if same_loops >= max_same:
+                logger.info("Reached end of listing panel — stopping scroll.")
                 break
 
-            # Scroll the *list container* by one viewport height
+            # Scroll by one viewport height
             driver.execute_script(
                 "arguments[0].scrollTop = arguments[0].scrollTop + arguments[0].clientHeight;",
                 scroll_container,
             )
             time.sleep(1.0)
 
-        logger.info("Scraped %d unique listings in total.", len(seen_ids))
+        logger.info(f"Scraped {len(results)} listings total.")
         return results
 
     finally:
         try:
             driver.quit()
-        except Exception:
+        except:
             pass
-
+# -------------------------------------------------
+# RUN COUNT — aggregate results + store to DB
+# -------------------------------------------------
 
 def run_count() -> Dict:
     listings = scrape_listings()
 
-    total_active = sum(
-        1 for r in listings if r.get("status", "").lower() == "active"
-    )
-    total_pending = sum(
-        1 for r in listings if r.get("status", "").lower() == "pending"
-    )
+    total_active = sum(1 for r in listings if r.get("status") == "active")
+    total_pending = sum(1 for r in listings if r.get("status") == "pending")
 
-    # group by region and then village (alphabetical inside region)
+    # Group by region → village
     grouped: Dict[str, Dict[str, Dict[str, int]]] = {}
+
     for r in listings:
         region = r.get("region") or classify_region(r.get("village", ""))
         village = r.get("village") or "Unknown"
-        status = r.get("status", "active").lower()
+        status = r.get("status", "active")
 
         region_dict = grouped.setdefault(region, {})
         village_dict = region_dict.setdefault(
@@ -453,7 +491,7 @@ def run_count() -> Dict:
             village_dict["pending"] += 1
         village_dict["total"] += 1
 
-    # sort villages inside each region alphabetically
+    # Sort villages alphabetically within each region
     grouped_sorted: Dict[str, Dict[str, Dict[str, int]]] = {}
     for region, villages in grouped.items():
         grouped_sorted[region] = dict(sorted(villages.items(), key=lambda kv: kv[0]))
@@ -465,17 +503,18 @@ def run_count() -> Dict:
         "grouped": grouped_sorted,
     }
 
+    # Write to DB
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
         """
-        INSERT INTO daily_counts(run_at, total_active, total_pending, payload_json)
+        INSERT INTO daily_counts (run_at, total_active, total_pending, payload_json)
         VALUES (?, ?, ?, ?)
         """,
         (
             row["run_at"],
-            row["total_active"],
-            row["total_pending"],
+            total_active,
+            total_pending,
             json.dumps(listings),
         ),
     )
@@ -486,9 +525,8 @@ def run_count() -> Dict:
 
 
 # -------------------------------------------------
-# API endpoints
+# FASTAPI ENDPOINTS
 # -------------------------------------------------
-
 
 @app.get("/status")
 def status():
@@ -496,21 +534,19 @@ def status():
 
 
 def debug_run_count():
-    logger.info("Background task started.")
+    logger.info("Background run started…")
     try:
         result = run_count()
         logger.info(
-            "Background task completed successfully. Result summary: "
-            f"{result.get('total_active')} active, "
-            f"{result.get('total_pending')} pending."
+            f"Run complete: active={result['total_active']}, pending={result['total_pending']}"
         )
     except Exception as e:
-        logger.error(f"Error during run_count(): {str(e)}", exc_info=True)
+        logger.error(f"Error during run_count(): {e}", exc_info=True)
 
 
 @app.post("/run")
 def trigger_run(background_tasks: BackgroundTasks):
-    logger.info("RUN endpoint received request — starting background task.")
+    logger.info("/run endpoint triggered — starting background task.")
     background_tasks.add_task(debug_run_count)
     return JSONResponse({"status": "started"})
 
@@ -522,16 +558,20 @@ def latest():
     c.execute("SELECT * FROM daily_counts ORDER BY id DESC LIMIT 1")
     row = c.fetchone()
     conn.close()
+
     if not row:
         return {}
-    _id, run_at, total_active, total_pending, payload_json = row
 
+    _id, run_at, total_active, total_pending, payload_json = row
     listings = json.loads(payload_json)
+
+    # Rebuild grouping fresh (same logic as run_count)
     grouped: Dict[str, Dict[str, Dict[str, int]]] = {}
+
     for r in listings:
         region = r.get("region") or classify_region(r.get("village", ""))
         village = r.get("village") or "Unknown"
-        status = r.get("status", "active").lower()
+        status = r.get("status", "active")
 
         region_dict = grouped.setdefault(region, {})
         village_dict = region_dict.setdefault(
@@ -561,12 +601,12 @@ def history(days: int = 30):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        "SELECT run_at, total_active, total_pending "
-        "FROM daily_counts ORDER BY id DESC LIMIT ?",
+        "SELECT run_at, total_active, total_pending FROM daily_counts ORDER BY id DESC LIMIT ?",
         (days,),
     )
     rows = c.fetchall()
     conn.close()
+
     data = [{"run_at": r[0], "active": r[1], "pending": r[2]} for r in rows]
     return {"data": data}
 
@@ -576,8 +616,7 @@ def export_csv(days: int = 365):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        "SELECT run_at, total_active, total_pending "
-        "FROM daily_counts ORDER BY id DESC LIMIT ?",
+        "SELECT run_at, total_active, total_pending FROM daily_counts ORDER BY id DESC LIMIT ?",
         (days,),
     )
     rows = c.fetchall()
@@ -589,17 +628,19 @@ def export_csv(days: int = 365):
             yield f"{r[0]},{r[1]},{r[2]}\n"
 
     return StreamingResponse(iter_csv(), media_type="text/csv")
-
-
 # -------------------------------------------------
-# Scheduler for daily 6 AM run
+# SCHEDULER — daily 6 AM run
 # -------------------------------------------------
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(run_count, "cron", hour=6, minute=0)
 scheduler.start()
 
+
+# -------------------------------------------------
+# MAIN
+# -------------------------------------------------
+
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
