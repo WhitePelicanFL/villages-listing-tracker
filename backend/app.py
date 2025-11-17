@@ -226,56 +226,54 @@ def parse_card(card) -> Dict:
     """
     Extract structured info from a propertyCard element.
 
-    Changes vs your original:
-    - Supports both VNH# and VLS# codes.
-    - Normalizes to VNH240V045 / VLS123456 style IDs.
-    - Uses VNH → 'new', VLS → 'preowned' mapping as primary
-      and falls back to text-based detection.
+    Fix: filter out placeholder (virtual repeat) cards.
+    A real listing MUST have:
+      - non-empty text
+      - a Village line ("The Village of ...")
+    ID may be VNH/VLS or generic fallback.
     """
+
     full_text = card.text or ""
-    lower = full_text.lower()
+    if not full_text.strip():
+        return {"skip": True}   # empty placeholder
 
-    # -------------------------------------------------
-    # ID: VNH# or VLS#
-    # -------------------------------------------------
-    uid = ""
-    list_type = ""  # we'll set to "new" or "preowned"
+    lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
+    if not lines:
+        return {"skip": True}
 
-    for line in full_text.splitlines():
-        stripped = line.strip()
-        upper_line = stripped.upper()
-        if upper_line.startswith("VNH#") or upper_line.startswith("VLS#"):
-            id_info = normalize_id_line(upper_line)
-            uid = id_info["id"]
-            if id_info["type"]:
-                list_type = id_info["type"]
-            break
-
-    # If no usable ID, this is not a real listing → skip
-    if not uid or uid == "" or uid.startswith("VNH") is False and uid.startswith("VLS") is False:
-        return {"id": "", "skip": True}
-
-    # -------------------------------------------------
-    # Village (line that contains "The Village of")
-    # -------------------------------------------------
+    # Must have a Village line to be real
     village = ""
-    for line in full_text.splitlines():
+    for line in lines:
         if "village of" in line.lower():
             village = line.strip()
             break
+    if not village:
+        return {"skip": True}   # placeholder card, not a real listing
 
-    # -------------------------------------------------
-    # Status: default active, look for "pending" / "under contract"
-    # -------------------------------------------------
+    # ID detection
+    uid = ""
+    list_type = ""
+
+    for line in lines:
+        upper = line.upper()
+        if upper.startswith("VNH#") or upper.startswith("VLS#"):
+            id_info = normalize_id_line(upper)
+            uid = id_info["id"]
+            list_type = id_info["type"]
+            break
+
+    # If no VNH/VLS, generate fallback ID from text
+    if not uid:
+        # use first non-empty line as fallback
+        uid = lines[0][:40]
+
+    # Determine status
+    lower = full_text.lower()
     status = "active"
     if "pending" in lower or "under contract" in lower:
         status = "pending"
 
-    # -------------------------------------------------
-    # Type: new vs preowned
-    #   - Prefer VNH/VLS mapping
-    #   - Fall back to text check
-    # -------------------------------------------------
+    # Determine type if prefix didn't specify
     if not list_type:
         list_type = "preowned"
         if "new home" in lower or "model" in lower:
@@ -284,6 +282,7 @@ def parse_card(card) -> Dict:
     region = classify_region(village)
 
     return {
+        "skip": False,
         "id": uid,
         "title": full_text[:120],
         "status": status,
@@ -291,7 +290,6 @@ def parse_card(card) -> Dict:
         "village": village,
         "region": region,
     }
-
 
 def scrape_listings() -> List[Dict]:
     """
@@ -388,7 +386,7 @@ def scrape_listings() -> List[Dict]:
                     if data.get("skip"):
                         continue
                     uid = data["id"]
-                    if uid in seen_ids:
+                    if not uid:
                         continue
                     seen_ids.add(uid)
                     results.append(data)
