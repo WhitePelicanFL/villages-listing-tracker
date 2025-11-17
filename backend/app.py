@@ -420,6 +420,16 @@ def scrape_listings() -> List[Dict]:
         while True:
             cards = driver.find_elements(By.CSS_SELECTOR, "md-card.propertyCard")
 
+            # DEBUG: dump first 3 cards' text once so we see raw content
+            if not sample_dumped:
+                logger.info("DEBUG: dumping text of first 3 cards")
+                for c in cards[:3]:
+                    try:
+                        logger.info("CARD TEXT:\n%s\n---", c.text)
+                    except Exception:
+                        pass
+                sample_dumped = True
+
             new_count = 0
             for card in cards:
                 try:
@@ -468,6 +478,19 @@ def scrape_listings() -> List[Dict]:
 
 def run_count() -> Dict:
     listings = scrape_listings()
+
+    # DEBUG SUMMARY: what are we actually seeing?
+    vnh = sum(1 for r in listings if str(r.get("id", "")).upper().startswith("VNH"))
+    vls = sum(1 for r in listings if str(r.get("id", "")).upper().startswith("VLS"))
+    type_new = sum(1 for r in listings if r.get("type") == "new")
+    type_pre = sum(1 for r in listings if r.get("type") == "preowned")
+    pending_ct = sum(1 for r in listings if r.get("status") == "pending")
+
+    logger.info(
+        "DEBUG SUMMARY: total=%d, VNH=%d, VLS=%d, type_new=%d, type_pre=%d, pending=%d",
+        len(listings), vnh, vls, type_new, type_pre, pending_ct,
+    )
+    # ----- end debug summary -----
 
     total_active = sum(1 for r in listings if r.get("status") == "active")
     total_pending = sum(1 for r in listings if r.get("status") == "pending")
