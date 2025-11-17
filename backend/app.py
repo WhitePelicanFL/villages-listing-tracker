@@ -414,6 +414,8 @@ def scrape_listings() -> List[Dict]:
         seen = set()
         results: List[Dict] = []
 
+        sample_dumped = False
+        
         same_loops = 0
         max_same = 10
 
