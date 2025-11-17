@@ -52,6 +52,17 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
+# -------------------------------------------------
+# Backward compatibility for old UI / cron: run_count()
+# -------------------------------------------------
+
+def run_count():
+    """
+    Legacy helper used by old frontend buttons and run_once.py.
+    It simply triggers the full scrape and returns the result.
+    """
+    result = run_scrape_once()
+    return result
 
 def init_db():
     conn = get_db_connection()
@@ -382,6 +393,13 @@ def on_startup():
 def health_check():
     return {"status": "ok", "message": "Villages Listing Tracker backend running."}
 
+@app.post("/run")
+def legacy_run():
+    """
+    Legacy endpoint used by the old UI "Run Count" button.
+    Behaves exactly like /scrape.
+    """
+    return run_count()
 
 @app.post("/scrape")
 def scrape_now():
