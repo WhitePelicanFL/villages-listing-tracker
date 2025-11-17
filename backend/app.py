@@ -291,6 +291,7 @@ def parse_card(card) -> Dict:
         "region": region,
     }
 
+
 def scrape_listings() -> List[Dict]:
     """
     Core scraping logic.
@@ -302,7 +303,7 @@ def scrape_listings() -> List[Dict]:
       → this guarantees the list can show ALL listings.
     - Uses md-virtual-repeat behavior:
         * Only a handful of cards are in the DOM at once.
-        * We scroll the *scroll container* (md-content) to load more.
+        * We scroll the *scroll container* to load more.
     - Harvests cards on every scroll and de-duplicates by ID.
     """
     logger.info("Launching Selenium WebDriver...")
@@ -314,56 +315,45 @@ def scrape_listings() -> List[Dict]:
 
         wait = WebDriverWait(driver, 30)
 
-        # Wait for the scroll container and at least one card
+        # Wait for at least one card
         try:
-            # Scroll container
-            #scroll_container = wait.until(
-            #    EC.presence_of_element_located((By.CSS_SELECTOR, "md-content"))
-            #)
-            
-            # Find one card
             sample_card = wait.until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "md-card.propertyCard"))
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, "md-card.propertyCard")
+                )
             )
-            
+
             # Walk up ancestors to find real scrollable container
             scroll_container = None
             ancestor = sample_card
-            
+
             for _ in range(10):  # walk up up to 10 levels
                 parent = ancestor.find_element(By.XPATH, "..")
-            
+
                 scroll_height = driver.execute_script(
                     "return arguments[0].scrollHeight;", parent
                 )
                 client_height = driver.execute_script(
                     "return arguments[0].clientHeight;", parent
                 )
-            
+
                 # scrollable if content area is bigger than visible area
                 if scroll_height > client_height + 20:
                     scroll_container = parent
                     break
-            
+
                 ancestor = parent
-            
+
             if not scroll_container:
                 raise Exception("Could not locate scrollable container for virtual list")
-            
-            logger.info("Detected TRUE scroll container for virtual list.")
 
-            # First listing card
-            wait.until(
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, "md-card.propertyCard")
-                )
-            )
+            logger.info("Detected TRUE scroll container for virtual list.")
             logger.info(
-                "md-content scroll container and first listing card detected – starting scroll harvesting."
+                "Scroll container and first listing card detected – starting scroll harvesting."
             )
         except Exception:
             logger.error(
-                "ERROR: Could not find md-content and/or listing cards – returning empty list."
+                "ERROR: Could not find scroll container and/or listing cards – returning empty list."
             )
             return []
 
@@ -388,6 +378,11 @@ def scrape_listings() -> List[Dict]:
                     uid = data["id"]
                     if not uid:
                         continue
+
+                    # *** TRUE DEDUPE ***
+                    if uid in seen_ids:
+                        continue
+
                     seen_ids.add(uid)
                     results.append(data)
                     new_this_round += 1
@@ -396,9 +391,9 @@ def scrape_listings() -> List[Dict]:
                     continue
 
             logger.info(
-                "Harvest loop: saw %d cards, total unique so far: %d (new_this_round=%d)",
+                "Harvest loop: saw %d cards, total unique IDs so far: %d (new_this_round=%d)",
                 len(cards),
-                len(results),
+                len(seen_ids),
                 new_this_round,
             )
 
@@ -413,14 +408,14 @@ def scrape_listings() -> List[Dict]:
                 )
                 break
 
-            # Scroll the *list container* (md-content) by one viewport height
+            # Scroll the *list container* by one viewport height
             driver.execute_script(
                 "arguments[0].scrollTop = arguments[0].scrollTop + arguments[0].clientHeight;",
                 scroll_container,
             )
             time.sleep(1.0)
 
-        logger.info("Scraped %d unique listings in total.", len(results))
+        logger.info("Scraped %d unique listings in total.", len(seen_ids))
         return results
 
     finally:
