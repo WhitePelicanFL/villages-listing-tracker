@@ -32,6 +32,15 @@ DB_PATH = os.environ.get("DB_PATH", "counts.db")
 HOMEFINDER_URL = "https://www.thevillages.com/homefinder"
 
 app = FastAPI(title="Villages Listing Tracker")
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],       # Allow all domains (including your frontend)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -129,8 +138,7 @@ def scrape_listings() -> List[Dict]:
     try:
         driver.get(HOMEFINDER_URL)    
         time.sleep(3)
-
-    logger.info("Loaded HOMEFINDER page...")
+        logger.info("Loaded HOMEFINDER page...")
     
         # Try to locate the listing container
         try:
