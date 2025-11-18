@@ -99,25 +99,22 @@
       });
     }
 
-    async function fetchHistory() {
-      const r = await fetch(API + "/history?days=30");
-      const j = await r.json();
-      const tbody = document.querySelector("#historyTable tbody");
-      tbody.innerHTML = "";
-      (j.data || []).forEach(row => {
-        const tr = document.createElement("tr");
-        tr.innerHTML = "<td>" + row.run_at + "</td><td>" + row.active + "</td><td>" + row.pending + "</td>";
-        tbody.appendChild(tr);
-      });
-    }
-
     async function runCount() {
-      await fetch(API + "/run", {method: "POST"});
-      setTimeout(() => { fetchLatest(); fetchHistory(); }, 8000);
+        await fetch(API + "/run", {method: "POST"});
+        setTimeout(() => { fetchLatest(); }, 5000);
     }
 
-    fetchLatest();
-    fetchHistory();
+    async function fetchLatest() {
+        const r = await fetch(API + "/count");
+        const j = await r.json();
+        document.querySelector("#latest").innerHTML = j.total_listings_rows;
+    }
+    
+    async function fetchHistory() {
+        const tbody = document.querySelector("#historyTable tbody");
+        tbody.innerHTML = "<tr><td colspan='3'>History not implemented in new backend</td></tr>";
+    }
+    
   </script>
 </body>
 </html>
