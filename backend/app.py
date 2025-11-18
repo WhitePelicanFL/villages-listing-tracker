@@ -28,13 +28,24 @@ from selenium.webdriver.support import expected_conditions as EC
 # Config
 # -------------------------------------------------
 
+# The correct map center (YOU provided it)
+VILLAGES_LAT = 28.872325543285804
+VILLAGES_LNG = -81.99806323437654
+
 DB_PATH = os.environ.get("DB_PATH", "counts.db")
 
-# Homefinder SPA (no WordPress wrapper, no homesites)
-# new & preowned & status (for-sale) only; hide header to reduce clutter
+# Homefinder SPA on the dev host, with:
+# - lat / lng / lvl=1 to ensure:
+#     * Zoom level 1 (all the way out)
+#     * Map centered over The Villages
+# - new & preowned & status (for-sale only)
+# - hideHeader to reduce clutter
 HOMEFINDER_URL = (
     "https://development.avengers.thevillages.com/homefinder/"
-    "?new&preowned&status&hideHeader"
+    f"?lat={VILLAGES_LAT}"
+    f"&lng={VILLAGES_LNG}"
+    f"&lvl=1"
+    f"&new&preowned&status&hideHeader"
 )
 
 app = FastAPI(title="Villages Listing Tracker")
@@ -180,45 +191,100 @@ def make_driver():
     return driver
 
 
+def normalize_id_line(line: str) -> Dict:
+    """
+    Given a line like:
+      'VNH# 240V045'
+      'VLS# 123-456'
+    return a dict with normalized id and type info.
+
+    Normalized IDs:
+      VNH# 240V045 -> VNH240V045
+      VLS# 123-456 -> VLS123456
+    """
+    text = line.strip().upper()
+
+    if text.startswith("VNH#"):
+        prefix = "VNH"
+        tail = text[4:]
+    elif text.startswith("VLS#"):
+        prefix = "VLS"
+        tail = text[4:]
+    else:
+        return {"id": "", "prefix": "", "type": ""}
+
+    # Remove non-alphanumeric from the remainder
+    tail = "".join(ch for ch in tail if ch.isalnum())
+    norm_id = f"{prefix}{tail}" if tail else ""
+
+    home_type = "new" if prefix == "VNH" else "preowned"
+
+    return {"id": norm_id, "prefix": prefix, "type": home_type}
+
+
 def parse_card(card) -> Dict:
     """
     Extract structured info from a propertyCard element.
+
+    Changes vs your original:
+    - Supports both VNH# and VLS# codes.
+    - Normalizes to VNH240V045 / VLS123456 style IDs.
+    - Uses VNH → 'new', VLS → 'preowned' mapping as primary
+      and falls back to text-based detection.
     """
     full_text = card.text or ""
     lower = full_text.lower()
 
-    # VNH# as unique ID
-    vnh = ""
+    # -------------------------------------------------
+    # ID: VNH# or VLS#
+    # -------------------------------------------------
+    uid = ""
+    list_type = ""  # we'll set to "new" or "preowned"
+
     for line in full_text.splitlines():
-        line = line.strip()
-        if line.upper().startswith("VNH#"):
-            # "VNH# 243V033"
-            parts = line.replace("#", "").split()
-            if len(parts) >= 2:
-                vnh = parts[1].strip()
+        stripped = line.strip()
+        upper_line = stripped.upper()
+        if upper_line.startswith("VNH#") or upper_line.startswith("VLS#"):
+            id_info = normalize_id_line(upper_line)
+            uid = id_info["id"]
+            if id_info["type"]:
+                list_type = id_info["type"]
             break
 
-    # village (line that contains "The Village of")
+    # If no usable ID, this is not a real listing → skip
+    if not uid or uid == "" or uid.startswith("VNH") is False and uid.startswith("VLS") is False:
+        return {"id": "", "skip": True}
+
+    # -------------------------------------------------
+    # Village (line that contains "The Village of")
+    # -------------------------------------------------
     village = ""
     for line in full_text.splitlines():
         if "village of" in line.lower():
             village = line.strip()
             break
 
-    # status: default active, look for "pending" text
+    # -------------------------------------------------
+    # Status: default active, look for "pending" / "under contract"
+    # -------------------------------------------------
     status = "active"
     if "pending" in lower or "under contract" in lower:
         status = "pending"
 
-    # type: new vs preowned
-    list_type = "preowned"
-    if "new home" in lower or "model" in lower:
-        list_type = "new"
+    # -------------------------------------------------
+    # Type: new vs preowned
+    #   - Prefer VNH/VLS mapping
+    #   - Fall back to text check
+    # -------------------------------------------------
+    if not list_type:
+        list_type = "preowned"
+        if "new home" in lower or "model" in lower:
+            list_type = "new"
 
     region = classify_region(village)
 
     return {
-        "id": vnh or full_text[:40],
+        "id": uid,
         "title": full_text[:120],
         "status": status,
         "type": list_type,
@@ -231,11 +297,15 @@ def scrape_listings() -> List[Dict]:
     """
     Core scraping logic.
 
-    Key change vs earlier versions:
-    - The list uses md-virtual-repeat, so only ~10–15 cards exist
-      in the DOM at once.
-    - We now harvest cards on *every scroll* and deduplicate by VNH#
-      so we accumulate the full set of listings.
+    Updated logic:
+    - Loads Homefinder with lat/lng/lvl=1 so map is:
+        * Zoom level 1
+        * Centered over The Villages
+      → this guarantees the list can show ALL listings.
+    - Uses md-virtual-repeat behavior:
+        * Only a handful of cards are in the DOM at once.
+        * We scroll the *scroll container* (md-content) to load more.
+    - Harvests cards on every scroll and de-duplicates by ID.
     """
     logger.info("Launching Selenium WebDriver...")
     driver = make_driver()
@@ -244,20 +314,62 @@ def scrape_listings() -> List[Dict]:
         logger.info(f"Loading Homefinder URL: {HOMEFINDER_URL}")
         driver.get(HOMEFINDER_URL)
 
-        # Wait for at least one propertyCard to appear
+        wait = WebDriverWait(driver, 30)
+
+        # Wait for the scroll container and at least one card
         try:
-            WebDriverWait(driver, 30).until(
+            # Scroll container
+            #scroll_container = wait.until(
+            #    EC.presence_of_element_located((By.CSS_SELECTOR, "md-content"))
+            #)
+            
+            # Find one card
+            sample_card = wait.until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "md-card.propertyCard"))
+            )
+            
+            # Walk up ancestors to find real scrollable container
+            scroll_container = None
+            ancestor = sample_card
+            
+            for _ in range(10):  # walk up up to 10 levels
+                parent = ancestor.find_element(By.XPATH, "..")
+            
+                scroll_height = driver.execute_script(
+                    "return arguments[0].scrollHeight;", parent
+                )
+                client_height = driver.execute_script(
+                    "return arguments[0].clientHeight;", parent
+                )
+            
+                # scrollable if content area is bigger than visible area
+                if scroll_height > client_height + 20:
+                    scroll_container = parent
+                    break
+            
+                ancestor = parent
+            
+            if not scroll_container:
+                raise Exception("Could not locate scrollable container for virtual list")
+            
+            logger.info("Detected TRUE scroll container for virtual list.")
+
+            # First listing card
+            wait.until(
                 EC.presence_of_element_located(
                     (By.CSS_SELECTOR, "md-card.propertyCard")
                 )
             )
-            logger.info("First listing card detected – starting scroll harvesting.")
+            logger.info(
+                "md-content scroll container and first listing card detected – starting scroll harvesting."
+            )
         except Exception:
             logger.error(
-                "ERROR: No listing cards ever appeared – returning empty list."
+                "ERROR: Could not find md-content and/or listing cards – returning empty list."
             )
             return []
 
+        # Let things stabilize a bit
         time.sleep(2)
 
         seen_ids = set()
@@ -275,7 +387,6 @@ def scrape_listings() -> List[Dict]:
                     data = parse_card(card)
                     uid = data["id"]
                     if not uid:
-                        # no stable ID, skip
                         continue
                     if uid in seen_ids:
                         continue
@@ -287,9 +398,10 @@ def scrape_listings() -> List[Dict]:
                     continue
 
             logger.info(
-                "Harvest loop: saw %d cards, total unique so far: %d",
+                "Harvest loop: saw %d cards, total unique so far: %d (new_this_round=%d)",
                 len(cards),
                 len(results),
+                new_this_round,
             )
 
             if new_this_round == 0:
@@ -298,14 +410,19 @@ def scrape_listings() -> List[Dict]:
                 same_count_loops = 0
 
             if same_count_loops >= max_same_loops:
-                logger.info("No new cards for several loops – assuming end of list.")
+                logger.info(
+                    "No new cards for several loops – assuming end of list / all listings loaded."
+                )
                 break
 
-            # scroll down a bit to trigger md-virtual-repeat to load more items
-            driver.execute_script("window.scrollBy(0, 900);")
+            # Scroll the *list container* (md-content) by one viewport height
+            driver.execute_script(
+                "arguments[0].scrollTop = arguments[0].scrollTop + arguments[0].clientHeight;",
+                scroll_container,
+            )
             time.sleep(1.0)
 
-        logger.info("Scraped %d listings in total.", len(results))
+        logger.info("Scraped %d unique listings in total.", len(results))
         return results
 
     finally:
