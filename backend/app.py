@@ -91,6 +91,21 @@ def init_db():
 # -------------------------------------------------
 # Selenium helpers
 # -------------------------------------------------
+def wait_for_homefinder_loaded(driver):
+    """
+    Wait until the left results panel appears, meaning React has mounted.
+    """
+    logger.info("Waiting for Homefinder React app to finish loading...")
+
+    try:
+        WebDriverWait(driver, 30).until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//*[contains(@class,'result') or contains(@class,'listing')]")
+            )
+        )
+        logger.info("Homefinder app fully loaded.")
+    except Exception:
+        logger.warning("Homefinder app did NOT fully load in time, continuing anyway.")
 
 
 def build_driver() -> webdriver.Chrome:
@@ -133,7 +148,6 @@ def wait_for_app_ready(driver: webdriver.Chrome):
 # -------------------------------------------------
 # Disable map + apply filters
 # -------------------------------------------------
-
 
 def disable_map_and_apply_filters(driver: webdriver.Chrome):
     logger.info("Disabling map and applying filters...")
@@ -390,6 +404,7 @@ def run_scrape_once() -> Dict:
 
     try:
         wait_for_app_ready(driver)
+        wait_for_homefinder_loaded(driver)
         disable_map_and_apply_filters(driver)
         load_all_results(driver)
 
