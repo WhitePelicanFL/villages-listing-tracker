@@ -1,5 +1,7 @@
 """
-Villages Listing Tracker backend - iframe-friendly scraper
+Villages Listing Tracker backend - FIXED FOR IFRAME VERSION
+Loads Angular Homefinder directly from:
+https://development.avengers.thevillages.com/homefinder/?hideHeader
 """
 
 import os
@@ -13,6 +15,7 @@ from typing import List, Dict
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from selenium import webdriver
@@ -23,7 +26,8 @@ from selenium.webdriver.support import expected_conditions as EC
 
 DB_PATH = os.environ.get("DB_PATH", "counts.db")
 
-# 👉 Load the same app that’s in the iframe
+# ⛔ DO NOT USE thevillages.com wrapper
+# ✅ USE THE RAW ANGULAR APP IN THE IFRAME
 HOMEFINDER_URL = (
     "https://development.avengers.thevillages.com/homefinder/?hideHeader"
 )
@@ -41,73 +45,45 @@ app.add_middleware(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --------- Regions & village grouping ---------
-
+# ----------- REGION DEFINITIONS -------------
 REGION_DEFS = {
-    "North of 466": [
-        "Orange Blossom Gardens", "Silver Lake", "Spanish Springs", "Santo Domingo",
-        "Rio Grande", "La Reynalda", "La Zamora", "La Crescenta", "Chula Vista",
-        "El Cortez", "El Santiago", "El Cortez",
-    ],
-    "Between 466 & 466A": [
-        "Belvedere", "Ashland", "Amelia", "Bonnybrook", "Liberty Park", "Hadley",
-        "Hemingway", "Duval", "Caroline", "Mallory Square", "Sabastian",
-        "Sunset Pointe", "Virginia Trace", "Lake Sumter Landing",
-    ],
-    "South of 466A": [
-        "St. Charles", "St. James", "Tamarind Grove", "Buttonwood", "St. James",
-        "Sanibel", "Hillsborough", "Collier", "Pinellas", "Charlotte",
-    ],
     "South of 44": [
-        "Fenney", "DeLuna", "Marsh Bend", "Chitty Chatty", "Bradford", "Citrus Grove",
-        "Hawkins", "Linden", "Monarch Grove", "St. Catherine", "St. Johns",
-        "St. Lucy", "Lake Denham", "Dabney",
-    ],
-    "New Southern / Future": [
-        "Eastport", "Newell", "Lake Denham East", "Future Development",
-    ],
+        "Fenney", "DeLuna", "Marsh Bend", "Chitty Chatty", "Bradford",
+        "Citrus Grove", "Hawkins", "Linden", "Monarch Grove", "St. Catherine",
+        "St. Johns", "St. Lucy", "Lake Denham", "Dabney"
+    ]
 }
-
 
 def classify_region(village: str) -> str:
     if not village:
         return "Unknown"
-    v = village.strip().lower()
+    v = village.lower()
     for region, villages in REGION_DEFS.items():
         for name in villages:
             if name.lower() in v:
                 return region
-    if "denham" in v:
-        return "South of 44"
-    if "dabney" in v or "eastport" in v or "newell" in v:
-        return "New Southern / Future"
     return "Unknown"
 
 
-# --------- DB helpers ---------
-
+# -------- DB INITIALIZATION ----------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS daily_counts (
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS daily_counts(
             id INTEGER PRIMARY KEY,
             run_at TEXT,
             total_active INTEGER,
             total_pending INTEGER,
             payload_json TEXT
         )
-        """
-    )
+    """)
     conn.commit()
     conn.close()
 
-
 init_db()
 
-# --------- Selenium helpers & scraping ---------
-
+# -------- SELENIUM SETUP ----------
 def make_driver():
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
@@ -121,6 +97,7 @@ def make_driver():
     return webdriver.Chrome(options=chrome_options)
 
 
+# -------- REAL SCRAPER (FIXED) ----------
 def scrape_listings() -> List[Dict]:
     logger.info("Launching Selenium...")
     driver = make_driver()
@@ -129,9 +106,10 @@ def scrape_listings() -> List[Dict]:
         logger.info(f"Loading Homefinder IFRAME APP: {HOMEFINDER_URL}")
         driver.get(HOMEFINDER_URL)
 
-        # give Angular a chance to boot
+        # Allow Angular to bootstrap
         time.sleep(5)
 
+        # The list lives inside md-card.propertyCard
         logger.info("Waiting for listing cards...")
         try:
             WebDriverWait(driver, 25).until(
@@ -140,113 +118,73 @@ def scrape_listings() -> List[Dict]:
                 )
             )
         except Exception:
-            logger.error(
-                "ERROR: No listing cards ever appeared (Angular did not render)."
-            )
-            try:
-                driver.save_screenshot("/tmp/homefinder_debug.png")
-                logger.error("Screenshot saved to /tmp/homefinder_debug.png")
-            except Exception:
-                pass
+            logger.error("ERROR: Cards never loaded! Dumping screenshot.")
+            driver.save_screenshot("/tmp/hf_debug.png")
             return []
 
         time.sleep(1)
 
-        # Scroll until card count stabilizes
+        # Infinite scroll
         last_count = -1
-        stable_ticks = 0
+        stability = 0
 
         while True:
             cards = driver.find_elements(By.CSS_SELECTOR, "md-card.propertyCard")
-            cur_count = len(cards)
+            count = len(cards)
 
-            if cur_count == last_count:
-                stable_ticks += 1
-                if stable_ticks >= 3:
+            if count == last_count:
+                stability += 1
+                if stability >= 3:
                     break
             else:
-                stable_ticks = 0
-                last_count = cur_count
+                stability = 0
+                last_count = count
 
-            driver.execute_script("window.scrollBy(0, 1000);")
+            driver.execute_script("window.scrollBy(0, 1100);")
             time.sleep(1)
 
         logger.info(f"Total cards found: {len(cards)}")
 
-        results: List[Dict] = []
+        # Extract data
+        listings = []
         for c in cards:
+            txt = c.text
+            lower = txt.lower()
+
+            status = "active"
+            if "pending" in lower or "under contract" in lower:
+                status = "pending"
+
+            village = ""
             try:
-                full_text = c.text
-                lower = full_text.lower()
+                v = c.find_element(By.CSS_SELECTOR, ".prop_village")
+                village = v.text.strip()
+            except:
+                # Try fallback: search for "Village of X" in text
+                for line in txt.splitlines():
+                    if "village" in line.lower():
+                        village = line.strip()
 
-                status = "active"
-                if "pending" in lower or "under contract" in lower:
-                    status = "pending"
+            listings.append({
+                "title": txt[:150],
+                "status": status,
+                "village": village,
+                "region": classify_region(village)
+            })
 
-                village = ""
-                try:
-                    village_el = c.find_element(By.CSS_SELECTOR, ".prop_village")
-                    village = village_el.text.strip()
-                except Exception:
-                    for line in full_text.splitlines():
-                        if "village" in line.lower():
-                            village = line.strip()
-                            break
-
-                region = classify_region(village)
-
-                results.append(
-                    {
-                        "title": full_text[:150],
-                        "status": status,
-                        "village": village,
-                        "region": region,
-                    }
-                )
-            except Exception:
-                continue
-
-        logger.info(f"Scraped {len(results)} listings.")
-        return results
+        logger.info(f"Scraped {len(listings)} listings.")
+        return listings
 
     finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        driver.quit()
 
 
-# --------- Run + aggregate ---------
-
-def aggregate_grouped(listings: List[Dict]) -> Dict[str, Dict[str, Dict[str, int]]]:
-    grouped: Dict[str, Dict[str, Dict[str, int]]] = {}
-    for r in listings:
-        region = r.get("region") or classify_region(r.get("village", ""))
-        village = (r.get("village") or "Unknown").strip()
-        status = r.get("status", "active").lower()
-
-        region_dict = grouped.setdefault(region, {})
-        village_dict = region_dict.setdefault(
-            village, {"active": 0, "pending": 0, "total": 0}
-        )
-        if status == "active":
-            village_dict["active"] += 1
-        elif status == "pending":
-            village_dict["pending"] += 1
-        village_dict["total"] += 1
-
-    # sort villages alphabetically in each region
-    grouped_sorted: Dict[str, Dict[str, Dict[str, int]]] = {}
-    for region, villages in grouped.items():
-        grouped_sorted[region] = dict(sorted(villages.items(), key=lambda kv: kv[0]))
-    return grouped_sorted
-
-
-def run_count() -> Dict:
+# -------- RUN COUNT ----------
+def run_count():
     listings = scrape_listings()
 
-    total_active = sum(1 for r in listings if r.get("status") == "active")
-    total_pending = sum(1 for r in listings if r.get("status") == "pending")
+    total_active = sum(1 for l in listings if l["status"] == "active")
+    total_pending = sum(1 for l in listings if l["status"] == "pending")
 
     row = {
         "run_at": datetime.utcnow().isoformat(),
@@ -257,8 +195,7 @@ def run_count() -> Dict:
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        "INSERT INTO daily_counts(run_at, total_active, total_pending, payload_json) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO daily_counts(run_at,total_active,total_pending,payload_json) VALUES (?,?,?,?)",
         (row["run_at"], total_active, total_pending, json.dumps(listings)),
     )
     conn.commit()
@@ -267,31 +204,23 @@ def run_count() -> Dict:
     return row
 
 
-# --------- API endpoints ---------
-
+# -------- API ENDPOINTS ----------
 @app.get("/status")
 def status():
     return {"status": "ok"}
 
 
-def debug_run_count():
-    logger.info("Background task started.")
+def debug_run():
     try:
-        result = run_count()
-        logger.info(
-            "Background task completed successfully. "
-            f"Result summary: {result.get('total_active')} active, "
-            f"{result.get('total_pending')} pending."
-        )
+        run_count()
     except Exception as e:
-        logger.error(f"Error during run_count(): {str(e)}", exc_info=True)
+        logger.error(str(e))
 
 
 @app.post("/run")
-def trigger_run(background_tasks: BackgroundTasks):
-    logger.info("RUN endpoint received request — starting background task.")
-    background_tasks.add_task(debug_run_count)
-    return JSONResponse({"status": "started"})
+def run(background_tasks: BackgroundTasks):
+    background_tasks.add_task(debug_run)
+    return {"status": "started"}
 
 
 @app.get("/latest")
@@ -301,67 +230,28 @@ def latest():
     c.execute("SELECT * FROM daily_counts ORDER BY id DESC LIMIT 1")
     row = c.fetchone()
     conn.close()
+
     if not row:
         return {}
 
-    _id, run_at, total_active, total_pending, payload_json = row
-    listings = json.loads(payload_json)
-
-    grouped_sorted = aggregate_grouped(listings)
-
+    _id, run_at, active, pending, payload_json = row
     return {
         "run_at": run_at,
-        "total_active": total_active,
-        "total_pending": total_pending,
-        "grouped": grouped_sorted,
+        "total_active": active,
+        "total_pending": pending,
+        "listings": json.loads(payload_json),
     }
 
 
-@app.get("/history")
-def history(days: int = 30):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        "SELECT run_at, total_active, total_pending "
-        "FROM daily_counts ORDER BY id DESC LIMIT ?",
-        (days,),
-    )
-    rows = c.fetchall()
-    conn.close()
-    data = [{"run_at": r[0], "active": r[1], "pending": r[2]} for r in rows]
-    return {"data": data}
-
-
-@app.get("/export.csv")
-def export_csv(days: int = 365):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        "SELECT run_at, total_active, total_pending "
-        "FROM daily_counts ORDER BY id DESC LIMIT ?",
-        (days,),
-    )
-    rows = c.fetchall()
-    conn.close()
-
-    def iter_csv():
-        yield "run_at,total_active,total_pending\n"
-        for r in rows:
-            yield f"{r[0]},{r[1]},{r[2]}\n"
-
-    return StreamingResponse(iter_csv(), media_type="text/csv")
-
-
 @app.get("/debug-screenshot")
-def debug_screenshot():
-    path = "/tmp/homefinder_debug.png"
+def screenshot():
+    path = "/tmp/hf_debug.png"
     if not os.path.exists(path):
-        return {"error": "No debug screenshot available"}
+        return {"error": "No screenshot available"}
     return FileResponse(path, media_type="image/png")
 
 
-# --------- Scheduler for daily 6 AM run ---------
-
+# -------- SCHEDULE DAILY --------
 scheduler = BackgroundScheduler()
 scheduler.add_job(run_count, "cron", hour=6, minute=0)
 scheduler.start()
