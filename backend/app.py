@@ -105,16 +105,31 @@ def build_driver() -> webdriver.Chrome:
     driver = webdriver.Chrome(options=chrome_options)
     return driver
 
-
 def wait_for_app_ready(driver: webdriver.Chrome):
     driver.get(HOMEFINDER_URL)
     logger.info("Loaded Homefinder URL: %s", HOMEFINDER_URL)
 
-    # Wait for the main app container or any obvious root
+    # Wait for outer page to load
     WebDriverWait(driver, SELENIUM_TIMEOUT).until(
         EC.presence_of_element_located((By.TAG_NAME, "body"))
-    )    
-    time.sleep(3)  # allow SPA to settle a bit
+    )
+
+    # Try to switch into the Homefinder iframe (the real app lives there)
+    try:
+        WebDriverWait(driver, 15).until(
+            EC.frame_to_be_available_and_switch_to_it((By.ID, "iframe"))
+        )
+        logger.info("Switched into Homefinder iframe.")
+    except Exception:
+        # In case the site changes and there is no iframe, just stay at top level
+        logger.info("No iframe with id='iframe' found; using top-level document.")
+
+    # Wait for the inner app body to be ready
+    WebDriverWait(driver, SELENIUM_TIMEOUT).until(
+        EC.presence_of_element_located((By.TAG_NAME, "body"))
+    )
+    time.sleep(3)  # allow the SPA to settle
+    
 # -------------------------------------------------
 # Disable map + apply filters
 # -------------------------------------------------
@@ -194,56 +209,60 @@ def disable_map_and_apply_filters(driver: webdriver.Chrome):
 # Safe auto-scroll function
 # -------------------------------------------------
 
-
 def load_all_results(driver: webdriver.Chrome):
     """
-    Scrolls the left listings container safely (Option B).
-    Continues until no more new results load for SCROLL_STABLE_ROUNDS cycles.
+    Scrolls the page (inside the iframe) until no new content loads.
+    We watch the overall document.body.scrollHeight for stability.
     """
 
     logger.info("Starting safe auto-scroll to load ALL listings...")
 
-    # The results scroll panel
-    results_xpath = "//div[contains(@class,'results-list') or contains(@class,'results-container')]"
-
-    results_panel = WebDriverWait(driver, SELENIUM_TIMEOUT).until(
-        EC.presence_of_element_located((By.XPATH, results_xpath))
-    )
-
-    prev_height = -1
+    last_height = -1
     stable_rounds = 0
 
     while stable_rounds < SCROLL_STABLE_ROUNDS:
-        driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", results_panel)
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(SCROLL_PAUSE)
 
-        # Check if new content loaded
-        new_height = driver.execute_script("return arguments[0].scrollHeight;", results_panel)
+        new_height = driver.execute_script("return document.body.scrollHeight;")
 
-        if new_height == prev_height:
+        if new_height == last_height:
             stable_rounds += 1
         else:
             stable_rounds = 0
 
-        prev_height = new_height
+        last_height = new_height
+        logger.info(f"Window scroll height: {new_height}, stable rounds: {stable_rounds}")
 
-        logger.info(f"Scrolling... current panel height: {new_height}, stable rounds: {stable_rounds}")
-
-    logger.info("All listings fully loaded.")
-
+    logger.info("Finished scrolling; assuming all listings are loaded.")
 
 # -------------------------------------------------
 # Extract listing cards
 # -------------------------------------------------
 
-
 def extract_listings(driver: webdriver.Chrome) -> List[Dict]:
     logger.info("Extracting listing cards...")
 
-    cards_xpath = "//div[contains(@class,'result-card') or contains(@class,'listing-card')]"
+    cards = []
 
-    cards = driver.find_elements(By.XPATH, cards_xpath)
-    logger.info("Found %d cards.", len(cards))
+    # Try several reasonable selectors – stop at the first that returns results
+    selectors = [
+        "[data-listing-id]",                      # most reliable if present
+        "[data-testid*='home-card']",
+        "[data-testid*='listing-card']",
+        ".result-card",
+        ".listing-card",
+    ]
+
+    for sel in selectors:
+        cards = driver.find_elements(By.CSS_SELECTOR, sel)
+        if cards:
+            logger.info("Found %d cards using selector '%s'.", len(cards), sel)
+            break
+
+    if not cards:
+        logger.warning("No listing cards found with any known selector.")
+        return []
 
     listings = []
 
@@ -251,40 +270,68 @@ def extract_listings(driver: webdriver.Chrome) -> List[Dict]:
         try:
             villages_id = c.get_attribute("data-listing-id") or ""
 
-            address = (
-                c.find_element(By.XPATH, ".//div[contains(@class,'address')]").text
-                if len(c.find_elements(By.XPATH, ".//div[contains(@class,'address')]")) > 0 else ""
+            # Address
+            address = ""
+            addr_candidates = c.find_elements(
+                By.XPATH,
+                ".//*[contains(@class,'address') or contains(@class,'Address') or contains(., 'The Villages, FL')]"
             )
+            if addr_candidates:
+                address = addr_candidates[0].text.strip()
 
-            price_raw = (
-                c.find_element(By.XPATH, ".//div[contains(@class,'price')]").text
-                if len(c.find_elements(By.XPATH, ".//div[contains(@class,'price')]")) > 0 else ""
+            # Price
+            price = 0
+            price_candidates = c.find_elements(
+                By.XPATH,
+                ".//*[contains(@class,'price') or contains(@class,'Price') or contains(text(),'$')]"
             )
-            price = int(price_raw.replace("$", "").replace(",", "").strip() or 0)
+            if price_candidates:
+                price_raw = price_candidates[0].text
+                price = int(
+                    price_raw.replace("$", "").replace(",", "").strip() or 0
+                )
 
-            bed_text = (
-                c.find_element(By.XPATH, ".//div[contains(@class,'beds')]").text
-                if len(c.find_elements(By.XPATH, ".//div[contains(@class,'beds')]")) > 0 else ""
+            # Beds
+            beds = ""
+            bed_candidates = c.find_elements(
+                By.XPATH,
+                ".//*[contains(@class,'bed') or contains(text(),'Bed')]"
             )
+            if bed_candidates:
+                beds = bed_candidates[0].text.strip()
 
-            bath_text = (
-                c.find_element(By.XPATH, ".//div[contains(@class,'baths')]").text
-                if len(c.find_elements(By.XPATH, ".//div[contains(@class,'baths')]")) > 0 else ""
+            # Baths
+            baths = ""
+            bath_candidates = c.find_elements(
+                By.XPATH,
+                ".//*[contains(@class,'bath') or contains(text(),'Bath')]"
             )
+            if bath_candidates:
+                baths = bath_candidates[0].text.strip()
 
-            sqft_text = (
-                c.find_element(By.XPATH, ".//div[contains(@class,'sqft')]").text
-                if len(c.find_elements(By.XPATH, ".//div[contains(@class,'sqft')]")) > 0 else ""
+            # Sqft
+            sqft = 0
+            sqft_candidates = c.find_elements(
+                By.XPATH,
+                ".//*[contains(@class,'sqft') or contains(text(),'sq ft') or contains(text(),'sqft')]"
             )
-            sqft = int(sqft_text.replace(",", "").replace("sqft", "").strip() or 0)
+            if sqft_candidates:
+                sqft_raw = sqft_candidates[0].text
+                sqft = int(
+                    sqft_raw.lower()
+                    .replace("sqft", "")
+                    .replace("sq ft", "")
+                    .replace(",", "")
+                    .strip() or 0
+                )
 
             listings.append(
                 {
                     "villages_id": villages_id,
                     "address": address,
                     "price": price,
-                    "beds": bed_text,
-                    "baths": bath_text,
+                    "beds": beds,
+                    "baths": baths,
                     "sqft": sqft,
                     "raw_html": c.get_attribute("innerHTML"),
                 }
@@ -293,8 +340,9 @@ def extract_listings(driver: webdriver.Chrome) -> List[Dict]:
         except Exception as e:
             logger.warning("Error parsing card: %s", e)
 
+    logger.info("Extracted %d listings.", len(listings))
     return listings
-    
+
 # -------------------------------------------------
 # DB insert/update
 # -------------------------------------------------
