@@ -319,41 +319,9 @@ def scrape_listings() -> List[Dict]:
         # Wait for the scroll container and at least one card
         try:
             # Scroll container
-            #scroll_container = wait.until(
-            #    EC.presence_of_element_located((By.CSS_SELECTOR, "md-content"))
-            #)
-            
-            # Find one card
-            sample_card = wait.until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "md-card.propertyCard"))
+            scroll_container = wait.until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "md-content"))
             )
-            
-            # Walk up ancestors to find real scrollable container
-            scroll_container = None
-            ancestor = sample_card
-            
-            for _ in range(10):  # walk up up to 10 levels
-                parent = ancestor.find_element(By.XPATH, "..")
-            
-                scroll_height = driver.execute_script(
-                    "return arguments[0].scrollHeight;", parent
-                )
-                client_height = driver.execute_script(
-                    "return arguments[0].clientHeight;", parent
-                )
-            
-                # scrollable if content area is bigger than visible area
-                if scroll_height > client_height + 20:
-                    scroll_container = parent
-                    break
-            
-                ancestor = parent
-            
-            if not scroll_container:
-                raise Exception("Could not locate scrollable container for virtual list")
-            
-            logger.info("Detected TRUE scroll container for virtual list.")
-
             # First listing card
             wait.until(
                 EC.presence_of_element_located(
