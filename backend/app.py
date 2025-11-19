@@ -251,9 +251,9 @@ def parse_card(card) -> Dict:
                 list_type = id_info["type"]
             break
 
-    # If no usable ID, this is not a real listing → skip
-    if not uid or uid == "" or uid.startswith("VNH") is False and uid.startswith("VLS") is False:
-        return {"id": "", "skip": True}
+    # If we couldn't find VNH/VLS, fall back to a generic id from text
+    if not uid:
+        uid = full_text[:40]
 
     # -------------------------------------------------
     # Village (line that contains "The Village of")
@@ -385,9 +385,9 @@ def scrape_listings() -> List[Dict]:
             for card in cards:
                 try:
                     data = parse_card(card)
-                    if data.get("skip"):
-                        continue
                     uid = data["id"]
+                    if not uid:
+                        continue
                     if uid in seen_ids:
                         continue
                     seen_ids.add(uid)
